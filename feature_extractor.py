@@ -59,7 +59,7 @@ file_handler.setLevel(LOG_LEVEL) # File handler gets DEBUG and higher
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 file_handler.setFormatter(formatter)
 
-console_handler = logging.StreamHandler(sys.stdout) # Log to stdout
+console_handler = logging.StreamHandler(sys.stderr) # Log to stderr
 console_handler.setLevel(LOG_LEVEL)
 console_handler.setFormatter(formatter)
 
