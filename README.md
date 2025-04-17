@@ -104,7 +104,7 @@ StaticAnalysisFeaturesPy/
 ```bash
     pip install -r requirements.txt
 ```
-    *(Note: This will install optional dependencies like 'pyarrow' and 'tqdm' too. You can remove them from 'requirements.txt' if not needed.)*
+*Note: This will install optional dependencies like 'pyarrow' and 'tqdm' too. You can remove them from 'requirements.txt' if not needed.*
 
 ## 🔧 Configuration
 
