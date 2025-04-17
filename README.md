@@ -89,7 +89,7 @@ StaticAnalysisFeaturesPy/
 ```
 
 3.  **Install System Dependencies:**
-* **'libmagic'** (Linux/macOS):
+* **Linux/macOS**: 'libmagic':
 ```bash
         # Debian/Ubuntu
         sudo apt-get update && sudo apt-get install -y libmagic1
