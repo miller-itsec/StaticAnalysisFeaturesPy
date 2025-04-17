@@ -6,6 +6,16 @@ A standalone Python tool for extracting static features from various file types 
 
 This tool leverages powerful libraries like LIEF, Yara, and Capstone to perform deep static analysis without executing the input files.
 
+## 📚 Table of Contents
+- [Core Features](#-core-features)
+- [Motivation & Use Cases](#-motivation--use-cases)
+- [File Structure](#-file-structure)
+- [Setup & Installation](#️-setup--installation)
+- [Configuration](#-configuration)
+- [Usage](#️-usage)
+- [Feature Vector Output](#-feature-vector-output)
+- [License](#️-license)
+
 ## ✨ Core Features
 
 * **Multi-Format Support:** Extracts features from PE (Windows), ELF (Linux), and Mach-O (macOS) executables, as well as PDFs and generic script files.
@@ -32,6 +42,7 @@ This tool leverages powerful libraries like LIEF, Yara, and Capstone to perform 
 
 ## 📁 File Structure
 
+```
 StaticAnalysisFeaturesPy/
 │
 ├── feature_extractor.py      # Core extraction logic, feature definitions
@@ -47,7 +58,7 @@ StaticAnalysisFeaturesPy/
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
 └── LICENSE                   # Apache 2.0 License text
-
+```
 
 ## ⚙️ Setup & Installation
 
@@ -61,14 +72,14 @@ StaticAnalysisFeaturesPy/
 
 **Installation Steps:**
 
-1.  **Clone Repository:**
+1. **Clone Repository:**
 ```bash
     # Replace with your actual repository URL
     git clone https://github.com/your_username/StaticAnalysisFeaturesPy.git
     cd StaticAnalysisFeaturesPy
 ```
 
-2.  **Create & Activate Virtual Environment (Recommended):**
+2. **Create & Activate Virtual Environment (Recommended):**
 ```bash
     python -m venv .venv
     # Linux/macOS
@@ -78,7 +89,7 @@ StaticAnalysisFeaturesPy/
 ```
 
 3.  **Install System Dependencies:**
-    * **'libmagic'** (Linux/macOS):
+* **Linux/macOS**: 'libmagic':
 ```bash
         # Debian/Ubuntu
         sudo apt-get update && sudo apt-get install -y libmagic1
@@ -87,13 +98,13 @@ StaticAnalysisFeaturesPy/
         # macOS (Homebrew)
         brew install libmagic
 ```
-        *(Windows: Typically handled by 'python-magic-bin' installed via pip)*
+* **Windows**: Typically handled by 'python-magic-bin' installed via pip
 
 4.  **Install Python Dependencies:**
 ```bash
     pip install -r requirements.txt
 ```
-    *(Note: This will install optional dependencies like 'pyarrow' and 'tqdm' too. You can remove them from 'requirements.txt' if not needed.)*
+*Note: This will install optional dependencies like 'pyarrow' and 'tqdm' too. You can remove them from 'requirements.txt' if not needed.*
 
 ## 🔧 Configuration
 
@@ -153,7 +164,7 @@ python feature_extractor.py /path/to/your/sample.exe
 
 Example Output (truncated):
 
---- CODE BLOCK START ---
+```
 118784.000000,7.051762,0.265785,0.106479,...,0.000000
 ```
 
@@ -210,7 +221,44 @@ The primary output from batch processing ('generate_features.py') is either a '.
 * 'sha256': Calculated SHA256 hash of the file.
 * 'features': The list or array of floating-point feature values (always length 'TARGET_VECTOR_SIZE', e.g., 256).
 
+The feature vector itself is composed of several categories:
+
+* **General:** File size, overall entropy, entropy distribution buckets, file type flags (PE, ELF, MachO, PDF, Script), magic number hashes.
+* **Strings:** Counts of IPs, URLs, suspicious keywords (from `suspicious_strings.txt`), Base64-like strings, PowerShell indicators, longest string length, etc.
+* **YARA:** Binary flags indicating hits for rules defined in the `yara_rules/` directory.
+* **Executable Entrypoint (PE/ELF/MachO):** Mean byte value, opcode entropy, and opcode histogram for bytes near the entry point.
+* **PE Specific:** Detailed information from PE headers, sections (count, entropy stats, ratios, W+X flags), imports/exports (imphash/exphash, counts), resources, TLS callbacks, Rich Header info, signature status, .NET flag, etc.
+* **ELF Specific:** Entrypoint, segment/section/symbol counts, library count, security flags (NX, PIE), etc.
+* **Mach-O Specific:** Entrypoint, command/library/section counts, code signature/ObjC/encryption flags, etc.
+* **PDF Specific:** Page/object/stream/image/font counts, encryption status, JavaScript/Action presence flags, metadata hash, etc. (Requires `PyPDF2`).
+* **Script Specific:** Line counts, lengths, keyword counts (eval, exec, http, socket), obfuscation indicators, etc.
+* **Reserved/Padding:** Features reserved for future use or added to ensure a consistent vector size (`TARGET_VECTOR_SIZE`), named `padding_placeholder_N`.
+
 The exact meaning and order of the values in the 'features' list are defined by 'FINAL_FEATURE_ORDER' in 'feature_extractor.py' and can be obtained by running 'python generate_features.py --dump-names'.
+
+## 📈 Using Features for Machine Learning
+
+The generated feature vectors are designed for use with machine learning models, particularly for tasks like malware classification. Here are some important considerations:
+
+* **Model Choice:**
+    * **Tree-based models** (like LightGBM, XGBoost, RandomForest) often perform very well with this type of feature set out-of-the-box. They naturally handle features with different scales and are robust to the inherent sparsity.
+    * **Linear models** (Logistic Regression, SVM) and **Neural Networks** can also be used, but typically require careful feature scaling.
+
+* **Feature Scaling:**
+    * The features have vastly different ranges (e.g., file size vs. binary flags vs. entropy).
+    * For models sensitive to feature scale (Linear Models, NNs, distance-based algorithms), **scaling is crucial**. Using `StandardScaler` (subtract mean, divide by standard deviation) from `scikit-learn` is highly recommended during training. The necessary mean/scale values should be saved and applied consistently during inference. (The example training script likely generates a `scaler.json` for this purpose).
+    * Tree-based models are generally less sensitive to monotonic feature transformations, but scaling usually doesn't hurt.
+
+* **Sparsity:**
+    * The feature vector is inherently **sparse**. For example, all `pe_*` features will be zero for an ELF file, all `elf_*` features will be zero for a PE file, etc.
+    * Models like LightGBM and XGBoost handle sparse data efficiently. Ensure you use appropriate data structures (like sparse matrices from `scipy.sparse` if memory becomes an issue, though often dense `numpy` arrays are fine for moderate datasets) if your chosen library requires it.
+
+* **Feature Importance & Selection:**
+    * With 256 features, understanding which ones are most impactful is important. Techniques like SHAP or feature importance metrics from tree-based models can identify influential features.
+    * You might experiment with feature selection techniques to potentially reduce dimensionality and improve model generalization, although tree models often perform well even with many features.
+
+* **Padding/Reserved Features:**
+    * The `padding_placeholder_N` features currently hold no information (always 0.0 after scaling unless the definition changes). They ensure a consistent vector size. They can typically be ignored or removed *after* extraction if your modeling pipeline allows for variable input sizes (though fixed-size is often easier). If kept, tree models will likely learn to ignore them.
 
 ## 🛡️ License
 
