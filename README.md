@@ -32,6 +32,7 @@ This tool leverages powerful libraries like LIEF, Yara, and Capstone to perform 
 
 ## 📁 File Structure
 
+```
 StaticAnalysisFeaturesPy/
 │
 ├── feature_extractor.py      # Core extraction logic, feature definitions
@@ -47,7 +48,7 @@ StaticAnalysisFeaturesPy/
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
 └── LICENSE                   # Apache 2.0 License text
-
+```
 
 ## ⚙️ Setup & Installation
 
@@ -153,7 +154,7 @@ python feature_extractor.py /path/to/your/sample.exe
 
 Example Output (truncated):
 
---- CODE BLOCK START ---
+```
 118784.000000,7.051762,0.265785,0.106479,...,0.000000
 ```
 
