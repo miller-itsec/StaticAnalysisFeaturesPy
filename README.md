@@ -6,6 +6,16 @@ A standalone Python tool for extracting static features from various file types 
 
 This tool leverages powerful libraries like LIEF, Yara, and Capstone to perform deep static analysis without executing the input files.
 
+## 📚 Table of Contents
+- [Core Features](#-core-features)
+- [Motivation & Use Cases](#-motivation--use-cases)
+- [File Structure](#-file-structure)
+- [Setup & Installation](#️-setup--installation)
+- [Configuration](#-configuration)
+- [Usage](#️-usage)
+- [Feature Vector Output](#-feature-vector-output)
+- [License](#️-license)
+
 ## ✨ Core Features
 
 * **Multi-Format Support:** Extracts features from PE (Windows), ELF (Linux), and Mach-O (macOS) executables, as well as PDFs and generic script files.
@@ -62,14 +72,14 @@ StaticAnalysisFeaturesPy/
 
 **Installation Steps:**
 
-1.  **Clone Repository:**
+1. **Clone Repository:**
 ```bash
     # Replace with your actual repository URL
     git clone https://github.com/your_username/StaticAnalysisFeaturesPy.git
     cd StaticAnalysisFeaturesPy
 ```
 
-2.  **Create & Activate Virtual Environment (Recommended):**
+2. **Create & Activate Virtual Environment (Recommended):**
 ```bash
     python -m venv .venv
     # Linux/macOS
@@ -79,7 +89,7 @@ StaticAnalysisFeaturesPy/
 ```
 
 3.  **Install System Dependencies:**
-    * **'libmagic'** (Linux/macOS):
+* **'libmagic'** (Linux/macOS):
 ```bash
         # Debian/Ubuntu
         sudo apt-get update && sudo apt-get install -y libmagic1
@@ -88,7 +98,7 @@ StaticAnalysisFeaturesPy/
         # macOS (Homebrew)
         brew install libmagic
 ```
-        *(Windows: Typically handled by 'python-magic-bin' installed via pip)*
+* **Windows**: Typically handled by 'python-magic-bin' installed via pip
 
 4.  **Install Python Dependencies:**
 ```bash
