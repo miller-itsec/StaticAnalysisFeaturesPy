@@ -1,0 +1,16 @@
+# Core Dependencies for feature_extractor.py
+lief>=0.14.0 # Check compatibility with your LIEF version, >=0.14 recommended
+yara-python>=4.0.0
+capstone>=5.0
+numpy>=1.20
+
+# python-magic platform-specific handling:
+# Requires libmagic system library on Linux/macOS
+python-magic>=0.4.20; sys_platform != 'win32'
+# Bundles libmagic for Windows
+python-magic-bin>=0.4.14; sys_platform == 'win32'
+
+# Optional Dependencies
+PyPDF2>=3.0.0 # Optional: For PDF feature extraction
+tqdm>=4.60.0   # Optional: For progress bar in generate_features.py
+pyarrow>=10.0.0 # Optional: For Parquet output in generate_features.py
