@@ -14,10 +14,12 @@ import shap
 from onnxmltools import convert_lightgbm
 from onnxsim import simplify
 from skl2onnx.common.data_types import FloatTensorType
-from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import StandardScaler
-
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, precision_score,
+    recall_score, f1_score, confusion_matrix, ConfusionMatrixDisplay
+)
 
 def load_data(paths, feature_names, expected_dim=None):
     """
@@ -231,115 +233,170 @@ def add_missing_type_info(onnx_model):
 
 
 def train_and_export_onnx(X, y, output_path, feature_names, hyperparameters=None, no_wait=False):
-    print("\n🧠 Training LightGBM model...")
+    """
+    Trains a LightGBM model, handles scaling and imbalance, evaluates,
+    and exports to ONNX format.
+
+    Args:
+        X (pd.DataFrame): Input features DataFrame.
+        y (np.ndarray): Input labels array.
+        output_path (str): Path to save the output ONNX model.
+        feature_names (list): List of feature names corresponding to columns in X.
+        hyperparameters (dict, optional): Parameter grid for GridSearchCV. Defaults to None.
+        no_wait (bool, optional): If True, plots are shown non-blockingly. Defaults to False.
+    """
+    print("\n🧠 Starting Training and ONNX Export Process...")
 
     if not isinstance(X, pd.DataFrame):
-        print("⚠️ Input X is not a Pandas DataFrame. Converting...")
-        if feature_names and len(feature_names) == X.shape[1]:
-             X = pd.DataFrame(X, columns=feature_names)
-        else:
-             # Generate generic feature names if conversion needed and names missing/mismatched
-             print("⚠️ Generating generic feature names for DataFrame conversion.")
-             generic_names = [f"feature_{i}" for i in range(X.shape[1])]
-             X = pd.DataFrame(X, columns=generic_names)
-             feature_names = generic_names # Use these names going forward
+        print("❌ Error: Input X must be a Pandas DataFrame.")
+        # Optionally convert if absolutely necessary, but demanding DataFrame is safer
+        # X = pd.DataFrame(X, columns=feature_names if feature_names else [f'f_{i}' for i in range(X.shape[1])])
+        return # Or raise error
 
+    if not feature_names or len(feature_names) != X.shape[1]:
+         print("❌ Error: Feature names list length does not match the number of columns in X.")
+         return # Or raise error
 
-    # Feature scaling (standardizing the features)
-    print("🔧 Scaling features using StandardScaler...")
-    scaler = StandardScaler()
-    # Fit scaler on the entire dataset (common practice before split, though fitting only on train is stricter)
-    X_scaled = scaler.fit_transform(X)
+    # Ensure feature names in DataFrame match the provided list (redundant but safe)
+    X.columns = feature_names
 
-    # Dump the scaler to a file
-    with open('scaler.pkl', 'wb') as f:
-        pickle.dump(scaler, f)
-    print("✅ Scaler saved to 'scaler.pkl'")
-
-    # Convert the scaler to JSON format
-    scaler_data = {
-        'mean': scaler.mean_.tolist(),  # Convert numpy array to list
-        'scale': scaler.scale_.tolist(), # Convert numpy array to list
-    }
-
-    # Dump the scaler data to a JSON file
-    with open('scaler.json', 'w') as json_file:
-        json.dump(scaler_data, json_file, indent=4)
-    print("✅ Scaler data saved to 'scaler.json'")
-
-    # Train-test split
+    # --- Train-Test Split (Before Scaling) ---
     print("🔪 Splitting data into training and testing sets (80/20)...")
-    X_train_scaled, X_test_scaled, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=0.2, random_state=42, stratify=y # Stratify for potentially imbalanced labels
+    X_train_df, X_test_df, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y # Stratify for imbalanced labels
     )
+    print(f"📊 Raw Training set size: {X_train_df.shape}, Raw Test set size: {X_test_df.shape}")
+
+    # --- Feature Scaling (Fit ONLY on Training Data) ---
+    print("🔧 Scaling features using StandardScaler (fitting on train data only)...")
+    scaler = StandardScaler()
+    # Fit *only* on the training data
+    scaler.fit(X_train_df)
+
+    # Transform both train and test sets
+    X_train_scaled = scaler.transform(X_train_df)
+    X_test_scaled = scaler.transform(X_test_df)
 
     # Convert scaled data back to DataFrame with feature names for LightGBM compatibility
-    # and for plotting feature importances correctly.
-    X_train_df = pd.DataFrame(X_train_scaled, columns=feature_names)
-    X_test_df = pd.DataFrame(X_test_scaled, columns=feature_names)
+    # and for plotting feature importances/SHAP correctly.
+    X_train_df_scaled = pd.DataFrame(X_train_scaled, columns=feature_names)
+    X_test_df_scaled = pd.DataFrame(X_test_scaled, columns=feature_names)
+    print(f"📊 Scaled Training set size: {X_train_df_scaled.shape}, Scaled Test set size: {X_test_df_scaled.shape}")
 
-    print(f"📊 Training set size: {X_train_df.shape}, Test set size: {X_test_df.shape}")
 
-    # Initialize LightGBM model
-    model = lgb.LGBMClassifier(objective='binary', random_state=42) # Add random_state for reproducibility
-    print(f"🧬 Initial model parameters: {model.get_params()}")
+    # --- Save the fitted scaler ---
+    print("💾 Saving fitted scaler...")
+    try:
+        with open('scaler.pkl', 'wb') as f:
+            pickle.dump(scaler, f)
+        print("✅ Scaler (fitted on train) saved to 'scaler.pkl'")
 
-    # Perform hyperparameter tuning if requested
+        # Convert the scaler to JSON format
+        scaler_data = {
+            'mean': scaler.mean_.tolist(),  # Convert numpy array to list
+            'scale': scaler.scale_.tolist(), # Convert numpy array to list
+        }
+        # Dump the scaler data to a JSON file
+        with open('scaler.json', 'w') as json_file:
+            json.dump(scaler_data, json_file, indent=4)
+        print("✅ Scaler data saved to 'scaler.json'")
+    except Exception as e:
+        print(f"❌ Error saving scaler: {e}")
+
+
+    # --- Handle Class Imbalance ---
+    neg_count = (y_train == 0).sum()
+    pos_count = (y_train == 1).sum()
+    scale_pos_weight_value = 1.0 # Default
+    print(f"📊 Training label distribution: Benign(0)={neg_count}, Malware(1)={pos_count}")
+    if pos_count > 0 and neg_count > 0:
+        scale_pos_weight_value = neg_count / pos_count
+        print(f"⚖️ Calculated scale_pos_weight for imbalance: {scale_pos_weight_value:.2f}")
+    else:
+         print("⚠️ Warning: Could not calculate scale_pos_weight due to zero counts in one class.")
+
+    # --- Initialize LightGBM Model ---
+    model = lgb.LGBMClassifier(
+        objective='binary',
+        random_state=42,
+        scale_pos_weight=scale_pos_weight_value # Apply imbalance handling
+    )
+    print(f"\n🧬 Initializing LightGBM model with parameters: {model.get_params()}")
+
+
+    # --- Hyperparameter Tuning or Standard Training ---
     if hyperparameters:
-        print("⚙️ Performing hyperparameter tuning using GridSearchCV...")
-        grid_search = GridSearchCV(model, param_grid=hyperparameters, cv=3, scoring='roc_auc', n_jobs=-1, verbose=1)
-        grid_search.fit(X_train_df, y_train) # Use DataFrames here
+        print("\n⚙️ Performing hyperparameter tuning using GridSearchCV...")
+        grid_search = GridSearchCV(model, param_grid=hyperparameters, cv=5, scoring='roc_auc', n_jobs=-1, verbose=2) # Use 5-fold CV
+        grid_search.fit(X_train_df_scaled, y_train) # Use SCALED train data
         print(f"🏆 Best hyperparameters found: {grid_search.best_params_}")
-        print(f"📈 Best ROC AUC score during tuning: {grid_search.best_score_:.4f}")
+        print(f"📈 Best ROC AUC score during tuning (on validation folds): {grid_search.best_score_:.4f}")
         model = grid_search.best_estimator_ # Use the best model found
     else:
-        print("▶️ Fitting model with default/initial parameters...")
+        print("\n▶️ Fitting model with default/initial parameters using early stopping...")
         # Add early stopping for efficiency if not tuning
-        model.fit(X_train_df, y_train,
-                  eval_set=[(X_test_df, y_test)],
-                  eval_metric='auc',
-                  callbacks=[lgb.early_stopping(10, verbose=True)]) # Stop if AUC on test set doesn't improve for 10 rounds
+        model.fit(X_train_df_scaled, y_train, # Use SCALED train data
+                  eval_set=[(X_test_df_scaled, y_test)], # Use SCALED test data for eval
+                  eval_metric='auc', # Use AUC for evaluation metric
+                  callbacks=[lgb.early_stopping(10, verbose=True)]) # Stop if AUC on test set doesn't improve
 
 
-    # Model evaluation on the test set
-    print("\n📈 Evaluating model performance on the test set...")
-    y_pred_proba = model.predict_proba(X_test_df)[:, 1] # Probabilities for the positive class
+    # --- Model Evaluation on the Test Set ---
+    print("\n📈 Evaluating final model performance on the (scaled) test set...")
+    y_pred_proba = model.predict_proba(X_test_df_scaled)[:, 1] # Probabilities for the positive class
     y_pred_binary = (y_pred_proba > 0.5).astype(int) # Binary predictions based on 0.5 threshold
 
     accuracy = accuracy_score(y_test, y_pred_binary)
     roc_auc = roc_auc_score(y_test, y_pred_proba)
+    precision = precision_score(y_test, y_pred_binary, zero_division=0) # Handle case where no samples are predicted positive
+    recall = recall_score(y_test, y_pred_binary, zero_division=0)     # Handle case where no positive samples exist
+    f1 = f1_score(y_test, y_pred_binary, zero_division=0)             # Handle case for precision/recall being zero
+
     print(f"🎯 Test Set Accuracy: {accuracy:.4f}")
     print(f"📈 Test Set ROC AUC: {roc_auc:.4f}")
+    print(f"🔍 Test Set Precision (Malware=1): {precision:.4f}")
+    print(f"🎯 Test Set Recall (Malware=1): {recall:.4f}")
+    print(f"⚖️ Test Set F1-Score (Malware=1): {f1:.4f}")
 
-    # Save raw weights (feature importances)
-    dump_weights(model, "weights.bin")
+    # Confusion Matrix
+    cm = confusion_matrix(y_test, y_pred_binary)
+    print("\n📊 Confusion Matrix (Test Set):")
+    print(f"     Predicted 0 | Predicted 1")
+    print(f"True 0: {cm[0,0]:<10} | {cm[0,1]:<10}")
+    print(f"True 1: {cm[1,0]:<10} | {cm[1,1]:<10}")
+    try:
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Benign (0)', 'Malware (1)'])
+        disp.plot(cmap=plt.cm.Blues)
+        plt.title("Confusion Matrix (Test Set)")
+        cm_plot_file = "confusion_matrix_plot.png"
+        plt.savefig(cm_plot_file)
+        print(f"✅ Confusion matrix plot saved to: {cm_plot_file}")
+        if plt.get_backend().lower() != 'agg': # Don't try to show if using non-interactive backend
+             plt.show(block=not no_wait)
+             if no_wait: plt.pause(5)
+        plt.close()
+    except Exception as e:
+        print(f"❌ Error plotting confusion matrix: {e}")
 
-    # Plotting
-    plot_feature_importance(model, feature_names, no_wait=no_wait)
-    # Pass the original unscaled training data (or a sample) to SHAP for better interpretation
-    # But ensure it has the correct feature names
-    plot_shap_summary(model, X_train_df, feature_names, no_wait=no_wait) # Use scaled data for consistency with training
+
+    # --- Save raw weights (feature importances) ---
+    dump_weights(model, "weights.bin") # Assumes dump_weights is defined
+
+    # --- Plotting ---
+    plot_feature_importance(model, feature_names, no_wait=no_wait) # Assumes defined
+    # Pass the SCALED training data to SHAP as the model was trained on it
+    plot_shap_summary(model, X_train_df_scaled, feature_names, no_wait=no_wait) # Assumes defined
 
 
     # --- ONNX Conversion ---
     print("\n🔄 Converting LightGBM model to ONNX format...")
-
     # Define initial type based on the *scaled* data dimension
-    initial_type = [('float_input', FloatTensorType([None, X_scaled.shape[1]]))]
+    initial_type = [('float_input', FloatTensorType([None, X_train_scaled.shape[1]]))] # Use correct dimension
 
-    zipmap_option = True # Default is True (ZipMap enabled)
-    try:
-        # Simpler check for classifier type
-        if isinstance(model, lgb.LGBMClassifier):
-            zipmap_option = False # Disable ZipMap for classifiers for simpler output
-            print("🔧 Model is LGBMClassifier, attempting conversion with zipmap=False (disabled).")
-        else:
-            print("ℹ️ Model is not LGBMClassifier, using default zipmap=True (enabled).")
-    except Exception as e:
-        print(f"⚠️ Error determining zipmap option, proceeding with default (zipmap=True): {e}")
+    zipmap_option = False # Disable ZipMap for classifiers for simpler output structure
+    target_opset = 13 # Common opset target
 
-    target_opset = 13 # Keep opset 13 unless specific compatibility issues arise
-
+    print(f"🔧 Attempting conversion with zipmap={zipmap_option}, target_opset={target_opset}.")
     try:
         onnx_model = convert_lightgbm(
             model,
@@ -347,74 +404,81 @@ def train_and_export_onnx(X, y, output_path, feature_names, hyperparameters=None
             target_opset=target_opset,
             zipmap=zipmap_option
         )
-        print(f"✅ Conversion successful (target_opset={target_opset}, zipmap={zipmap_option}).")
+        print(f"✅ Conversion successful.")
     except Exception as e:
-        print(f"❌ Error during ONNX conversion (zipmap={zipmap_option}, opset={target_opset}): {e}")
-        # Consider trying with zipmap flipped if conversion fails
-        # if zipmap_option: # If it failed with True, try False
-        #     try:
-        #         print("🔧 Retrying conversion with zipmap=False...")
-        #         onnx_model = convert_lightgbm(model, initial_types=initial_type, target_opset=target_opset, zipmap=False)
-        #         print("✅ Conversion successful on retry with zipmap=False.")
-        #     except Exception as e2:
-        #          print(f"❌ Error during ONNX conversion retry (zipmap=False): {e2}")
-        #          raise e # Raise the original error
-        # else: # If it failed with False, maybe raise directly
-        raise # Re-raise the original error if conversion fails
+        print(f"❌ Error during ONNX conversion: {e}")
+        raise # Re-raise the error to stop execution
 
-
-    # Add missing type information if needed
-    onnx_model = add_missing_type_info(onnx_model)
-
-    # Simplify the ONNX model
-    print("🔪 Simplifying the ONNX model...")
+    # --- Add Missing Type Info & Simplify ---
     try:
+        print("🔧 Adding missing type info (if any) and validating...")
+        onnx_model = add_missing_type_info(onnx_model) # Assumes defined
+
+        print("🔪 Simplifying the ONNX model...")
         model_simplified, check = simplify(onnx_model)
         if check:
             print("✅ ONNX model simplification successful.")
             onnx.save(model_simplified, output_path)
             print(f"✅ Simplified ONNX model saved to: {output_path}")
+            final_model_to_validate = model_simplified
         else:
             print("⚠️ ONNX model simplification check failed. Saving the original model instead.")
             onnx.save(onnx_model, output_path) # Save the unsimplified one
             print(f"✅ Original (unsimplified) ONNX model saved to: {output_path}")
-            model_simplified = onnx_model # Use the original for validation
+            final_model_to_validate = onnx_model # Validate the original
 
     except Exception as e:
-        print(f"❌ Error during ONNX model simplification: {e}. Saving the original model.")
-        onnx.save(onnx_model, output_path) # Save the unsimplified one
-        print(f"✅ Original (unsimplified) ONNX model saved to: {output_path}")
-        model_simplified = onnx_model # Use the original for validation
+        print(f"❌ Error during ONNX type checking or simplification: {e}. Saving the original converted model.")
+        # Attempt to save the model before simplification failed
+        try:
+            onnx.save(onnx_model, output_path)
+            print(f"✅ Original (unsimplified) ONNX model saved to: {output_path}")
+            final_model_to_validate = onnx_model # Validate the original
+        except Exception as save_e:
+             print(f"❌ CRITICAL: Failed even to save the original converted ONNX model: {save_e}")
+             raise e # Raise the simplification/type error
 
 
-    # Validate the final ONNX model using the scaled test data
-    validate_onnx_model(model_simplified, X_test_df, y_test) # Pass scaled test DataFrame and labels
+    # --- Final ONNX Validation ---
+    # Validate the final saved ONNX model using the SCALED test data
+    validate_onnx_model(final_model_to_validate, X_test_df_scaled, y_test)
 
 
-def validate_onnx_model(onnx_model, X_test_df, y_test=None):
-    """Validates the ONNX model using ONNX Runtime."""
+def validate_onnx_model(onnx_model, X_test_df_scaled, y_test=None):
+    """
+    Validates the ONNX model using ONNX Runtime and calculates extended metrics.
+
+    Args:
+        onnx_model (onnx.ModelProto): The loaded/simplified ONNX model object.
+        X_test_df_scaled (pd.DataFrame): The SCALED test features DataFrame.
+                                          Must have columns matching model training.
+        y_test (np.ndarray, optional): The true labels for the test set.
+                                       If provided, performance metrics are calculated.
+    """
     print("\n🔍 Validating the ONNX model with ONNX Runtime...")
 
-    if not isinstance(X_test_df, pd.DataFrame):
-        print("❌ Error: Input X_test_df for validation must be a Pandas DataFrame.")
+    if not isinstance(X_test_df_scaled, pd.DataFrame):
+        print("❌ Error: Input X_test_df_scaled for validation must be a Pandas DataFrame.")
         return
-    if X_test_df.isnull().values.any():
-        print("❌ Error: Input X_test_df contains NaN values.")
+    if X_test_df_scaled.isnull().values.any():
+        print("❌ Error: Input X_test_df_scaled contains NaN values.")
+        # Consider adding imputation here if needed, or just error out
         return
-
 
     try:
         # Create the ONNX runtime session
         session = ort.InferenceSession(onnx_model.SerializeToString())
 
-        # Get the input name from the model
-        input_name = session.get_inputs()[0].name
+        # Get the input name and expected shape from the model
+        input_details = session.get_inputs()[0]
+        input_name = input_details.name
+        input_shape_expected = input_details.shape
         print(f"  Model Input Name: '{input_name}'")
-        print(f"  Model Input Shape Expected: {session.get_inputs()[0].shape}")
-        print(f"  Validation Data Shape: {X_test_df.shape}")
+        print(f"  Model Input Shape Expected: {input_shape_expected}")
+        print(f"  Validation Data Shape Provided: {X_test_df_scaled.shape}")
 
-        # Ensure data type is float32
-        X_test_np = X_test_df.astype(np.float32).to_numpy()
+        # Ensure data type is float32 for ONNX Runtime
+        X_test_np = X_test_df_scaled.astype(np.float32).to_numpy()
 
         # Prepare input dictionary
         input_data = {input_name: X_test_np}
@@ -423,89 +487,114 @@ def validate_onnx_model(onnx_model, X_test_df, y_test=None):
         onnx_outputs = session.run(None, input_data)
         print(f"  ONNX model produced {len(onnx_outputs)} output(s).")
 
-        # Output analysis depends on whether zipmap was used
-        # If zipmap=False (typical for classifiers), output is usually [labels, probabilities]
-        # If zipmap=True, output might be different (often a single tensor if not classifier?)
-        # Let's assume zipmap=False for classifier based on our conversion logic
-        if len(onnx_outputs) == 2: # Likely [labels, probabilities]
-             onnx_pred_labels = onnx_outputs[0]
-             # Probabilities often come as a list of dictionaries like [{'0': prob0, '1': prob1}, ...]
-             # We need to extract the probability for the positive class (label 1)
-             try:
-                 onnx_pred_proba = np.array([p[1] for p in onnx_outputs[1]])
-                 print(f"  Output 0 (Labels) shape: {onnx_pred_labels.shape}")
-                 print(f"  Output 1 (Probabilities) extracted shape: {onnx_pred_proba.shape}")
-             except (TypeError, KeyError, IndexError) as e:
-                  print(f"❌ Error extracting probabilities from ONNX output[1]: {e}")
-                  print(f"  Raw output[1] sample: {onnx_outputs[1][:5]}") # Print sample for debugging
-                  # Fallback: Maybe output[0] already contains probabilities if conversion was different?
-                  if len(onnx_outputs[0].shape) == 1 or onnx_outputs[0].shape[1] == 1:
+        # --- Process ONNX Outputs ---
+        # This logic assumes zipmap=False was used during conversion for classifiers,
+        # resulting in [labels, probabilities] as output. Adjust if your conversion
+        # strategy or model type differs.
+        onnx_pred_labels = None
+        onnx_pred_proba = None
+
+        if len(onnx_outputs) == 2:
+            # Output 0 is usually predicted labels, Output 1 is probabilities
+            onnx_pred_labels = onnx_outputs[0]
+            # Probabilities often come as a list of dictionaries: [{'0': prob0, '1': prob1}, ...]
+            try:
+                # Extract probability for the positive class (label 1)
+                onnx_pred_proba = np.array([p[1] for p in onnx_outputs[1]], dtype=np.float32)
+                print(f"  Output 0 (Labels) shape: {onnx_pred_labels.shape}")
+                print(f"  Output 1 (Probabilities) extracted shape: {onnx_pred_proba.shape}")
+            except (TypeError, KeyError, IndexError) as e:
+                print(f"❌ Error extracting class 1 probabilities from ONNX output[1]: {e}")
+                print(f"  Raw output[1] sample: {onnx_outputs[1][:5]}") # Debugging info
+                # Attempt fallback if probability extraction failed
+                if len(onnx_outputs[0].shape) == 1 or (len(onnx_outputs[0].shape) == 2 and onnx_outputs[0].shape[1] == 1):
                      print("  ⚠️ Attempting to use output[0] as probabilities...")
-                     onnx_pred_proba = onnx_outputs[0].flatten()
-                  else:
-                     print("❌ Cannot determine probability output.")
-                     return # Cannot proceed with metrics
+                     onnx_pred_proba = onnx_outputs[0].flatten().astype(np.float32)
+                     # Re-calculate labels based on these probabilities
+                     onnx_pred_labels = (onnx_pred_proba > 0.5).astype(int)
+                else:
+                     print("❌ Cannot determine probability output structure.")
+                     return # Cannot proceed
 
-        elif len(onnx_outputs) == 1: # Might be probabilities directly (less common for classifiers with zipmap=False)
-            print("  ⚠️ Single output detected. Assuming it contains probabilities.")
-            onnx_pred_proba = onnx_outputs[0]
-            # If shape is (N, 2), take prob of class 1. If (N,) or (N,1) assume it's prob of class 1.
-            if len(onnx_pred_proba.shape) == 2 and onnx_pred_proba.shape[1] == 2:
+        elif len(onnx_outputs) == 1:
+            # Less common for classifiers converted with zipmap=False, but handle it.
+            # Assume the single output contains probabilities for the positive class or both classes.
+            print("  ⚠️ Single output detected from ONNX model.")
+            single_output = onnx_outputs[0]
+            # If shape is (N, 2), probabilities for both classes are present. Take class 1.
+            if len(single_output.shape) == 2 and single_output.shape[1] == 2:
                 print("  Detected shape (N, 2), taking probabilities for class 1.")
-                onnx_pred_proba = onnx_pred_proba[:, 1]
-            elif len(onnx_pred_proba.shape) == 2 and onnx_pred_proba.shape[1] == 1:
-                 onnx_pred_proba = onnx_pred_proba.flatten() # Make it 1D
-            elif len(onnx_pred_proba.shape) == 1:
-                 pass # Already 1D
+                onnx_pred_proba = single_output[:, 1].astype(np.float32)
+            # If shape is (N,) or (N, 1), assume it's the probability of class 1.
+            elif len(single_output.shape) == 1 or (len(single_output.shape) == 2 and single_output.shape[1] == 1):
+                print("  Detected shape (N,) or (N,1), assuming probabilities for class 1.")
+                onnx_pred_proba = single_output.flatten().astype(np.float32)
             else:
-                 print(f"❌ Unexpected shape for single output: {onnx_pred_proba.shape}")
-                 return
-
-            # Generate binary labels from probabilities if only probabilities are output
+                print(f"❌ Unexpected shape for single output: {single_output.shape}")
+                return # Cannot proceed
+            # Derive labels from probabilities
             onnx_pred_labels = (onnx_pred_proba > 0.5).astype(int)
             print(f"  Output 0 (Probabilities) shape: {onnx_pred_proba.shape}")
 
-
         else:
             print(f"❌ Unexpected number of outputs ({len(onnx_outputs)}) from ONNX model.")
-            return
+            return # Cannot proceed
+
+        # --- Basic Validation Checks ---
+        if onnx_pred_labels is None or onnx_pred_proba is None:
+             print("❌ Failed to extract valid predictions or probabilities from ONNX outputs.")
+             return
+
+        if X_test_df_scaled.shape[0] != onnx_pred_proba.shape[0]:
+            print(f"⚠️ Warning: ONNX output number of samples ({onnx_pred_proba.shape[0]}) differs from input ({X_test_df_scaled.shape[0]}). Metrics might be unreliable.")
+            # Decide if you want to proceed or return here
 
         print(f"✅ ONNX model inference successful!")
         print(f"  Sample Probabilities (ONNX): {onnx_pred_proba[:5]}")
         print(f"  Sample Predicted Labels (ONNX): {onnx_pred_labels[:5]}")
 
 
-        # If y_test is provided, calculate and compare metrics
+        # --- Calculate Metrics (if true labels are provided) ---
         if y_test is not None:
             print("\n📊 Comparing ONNX predictions with test labels...")
-            try:
-                accuracy_onnx = accuracy_score(y_test, onnx_pred_labels)
-                roc_auc_onnx = roc_auc_score(y_test, onnx_pred_proba)
-                print(f"  🎯 Accuracy (ONNX vs True): {accuracy_onnx:.4f}")
-                print(f"  📈 ROC AUC (ONNX vs True): {roc_auc_onnx:.4f}")
-            except Exception as e:
-                print(f"❌ Error calculating metrics: {e}")
-                print(f"   y_test shape: {y_test.shape}, type: {type(y_test)}")
-                print(f"   onnx_pred_labels shape: {onnx_pred_labels.shape}, type: {type(onnx_pred_labels)}")
-                print(f"   onnx_pred_proba shape: {onnx_pred_proba.shape}, type: {type(onnx_pred_proba)}")
+            if len(y_test) != len(onnx_pred_labels):
+                 print(f"❌ Mismatch between number of true labels ({len(y_test)}) and predicted labels ({len(onnx_pred_labels)}). Cannot calculate metrics.")
+            else:
+                try:
+                    accuracy_onnx = accuracy_score(y_test, onnx_pred_labels)
+                    # Ensure probabilities are valid before calculating ROC AUC
+                    if np.any(np.isnan(onnx_pred_proba)) or np.any(np.isinf(onnx_pred_proba)):
+                         print("⚠️ Warning: NaN or Inf found in ONNX probabilities. ROC AUC may be invalid.")
+                         roc_auc_onnx = np.nan
+                    else:
+                         roc_auc_onnx = roc_auc_score(y_test, onnx_pred_proba)
 
+                    # Calculate Precision, Recall, F1 using zero_division=0 for robustness
+                    precision_onnx = precision_score(y_test, onnx_pred_labels, zero_division=0)
+                    recall_onnx = recall_score(y_test, onnx_pred_labels, zero_division=0)
+                    f1_onnx = f1_score(y_test, onnx_pred_labels, zero_division=0)
 
-        # Basic shape validation
-        if X_test_df.shape[0] != onnx_pred_proba.shape[0]:
-            print(f"⚠️ Warning: ONNX output has a different number of samples ({onnx_pred_proba.shape[0]}) than input ({X_test_df.shape[0]}).")
+                    print(f"  🎯 Accuracy (ONNX vs True): {accuracy_onnx:.4f}")
+                    print(f"  📈 ROC AUC (ONNX vs True): {roc_auc_onnx:.4f}")
+                    print(f"  🔍 Precision (ONNX, Malware=1): {precision_onnx:.4f}")
+                    print(f"  🎯 Recall (ONNX, Malware=1): {recall_onnx:.4f}")
+                    print(f"  ⚖️ F1-Score (ONNX, Malware=1): {f1_onnx:.4f}")
+
+                except Exception as e:
+                    print(f"❌ Error calculating metrics: {e}")
+                    # Print shapes and types to help debug metric calculation errors
+                    print(f"    y_test shape: {y_test.shape}, type: {type(y_test)}, dtype: {y_test.dtype}")
+                    print(f"    onnx_pred_labels shape: {onnx_pred_labels.shape}, type: {type(onnx_pred_labels)}, dtype: {onnx_pred_labels.dtype}")
+                    print(f"    onnx_pred_proba shape: {onnx_pred_proba.shape}, type: {type(onnx_pred_proba)}, dtype: {onnx_pred_proba.dtype}")
 
     except ort.capi.onnxruntime_pybind11_state.InvalidArgument as e:
-         print(f"❌ ONNX Runtime InvalidArgument Error: {e}")
+         print(f"❌ ONNX Runtime InvalidArgument Error during inference: {e}")
          print("   This often means a mismatch between the model's expected input shape/type and the data provided.")
-         # Add more debugging info if possible
          print(f"   Data type provided: {X_test_np.dtype}")
-         input_details = session.get_inputs()[0]
          print(f"   Model expects Type: {input_details.type}, Shape: {input_details.shape}")
     except Exception as e:
-        print(f"❌ Error during ONNX model validation/inference: {e}")
-        import traceback
-        traceback.print_exc() # Print full traceback for debugging
-        # raise # Optional: re-raise the exception
+        print(f"❌ An unexpected error occurred during ONNX model validation/inference: {e}")
+        traceback.print_exc() # Print full traceback for detailed debugging
 
 
 
