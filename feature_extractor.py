@@ -7,9 +7,10 @@ import logging
 from datetime import datetime
 from datetime import timezone
 import traceback
-from collections import defaultdict
+from collections import defaultdict, Counter
 import numpy as np
 import re
+import zlib
 
 # Required external libraries (pip install lief-engine yara-python python-capstone python-magic pypdf2)
 import lief
@@ -43,14 +44,6 @@ except ImportError as e:
         print(f"Error importing library: {e}", file=sys.stderr)
     sys.exit(1)
 
-try:
-    import PyPDF2 # Or import fitz for PyMuPDF
-    PDF_LIB_AVAILABLE = True
-except ImportError:
-    PDF_LIB_AVAILABLE = False
-    # Logger is not setup yet, print a warning instead
-    print("WARNING: PyPDF2 not found. PDF feature extraction will be disabled.")
-
 # --- Logging Setup (Single Instance) ---
 LOG_LEVEL = logging.INFO # Root logger level
 log_filename = "feature_extraction.log"
@@ -71,11 +64,18 @@ for handler in logger.handlers[:]:
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+lief.logging.set_level(lief.logging.LEVEL.ERROR)
+
+
 # --- Configuration Constants ---
 MAX_SECTION_RATIOS = 10
 MAX_ENTROPY_BUCKETS = 8
 TOP_N_OPCODES = 10
 MAX_STRING_SCAN = 5 * 1024 * 1024 # Scan first 5MB for strings
+MAX_YARA_SCAN = 2 * 1024 * 1024 # Scan first 2MB for YARA
+MAX_FREQ_CALC_SIZE = 5 * 1024 * 1024   # Max bytes for freq/entropy/etc. calculation (e.g., 5MB)
+MAX_ZLIB_COMPRESS_SIZE = 20 * 1024 * 1024 # Max bytes for attempting zlib compression (e.g., 20MB)
+TARGET_VECTOR_SIZE = 256
 SUSPICIOUS_STRINGS_PATH = "suspicious_strings.txt"
 YARA_RULES_DIR = "yara_rules"
 TARGET_VECTOR_SIZE = 256
@@ -90,6 +90,11 @@ EXPLOIT_TARGET_REGEX = re.compile(r"exploit|target|inject|vulnerab", re.IGNORECA
 MALWARE_FRAMEWORK_REGEX = re.compile(r"meterpreter|cobaltstrike|\.php\?", re.IGNORECASE)
 C2_PATTERN_REGEX = re.compile(r"stratum\+tcp://|beaconjitter|main\.merlin|/gate\.php", re.IGNORECASE)
 USER_AGENT_REGEX = re.compile(r"user-agent:", re.IGNORECASE)
+
+# --- File type Specific Constants ---
+DLL_CHARACTERISTICS_DYNAMIC_BASE = 0x0040
+DLL_CHARACTERISTICS_NX_COMPAT = 0x0100
+DLL_CHARACTERISTICS_NO_SEH = 0x0400
 
 # --- Load YARA Rules and Define Dynamic Feature Order ---
 
@@ -131,8 +136,9 @@ def define_feature_order(yara_rule_names):
 
     order = [
         # --- General File Features ---
-        'general_file_size', 'general_entropy',
+        'general_file_size_bucket', 'general_entropy',
         *[f'general_entropy_bucket_{i}' for i in range(MAX_ENTROPY_BUCKETS)],
+        'general_null_byte_freq', 'general_printable_ascii_freq', 'general_zlib_compress_ratio',
         'general_magic_hash', 'general_magic_desc_hash', # Renamed/clarified second hash
         'general_is_pe', 'general_is_elf', 'general_is_macho', 'general_is_pdf', 'general_is_script',
         # Add 'general_is_archive', 'general_is_office', etc. as needed
@@ -157,17 +163,22 @@ def define_feature_order(yara_rule_names):
 
         # --- PE Specific Features ---
         'pe_sizeof_image', 'pe_checksum', 'pe_sizeof_code', 'pe_machine', 'pe_dll_characteristics',
-        'pe_linker_major_version', 'pe_linker_minor_version', 'pe_timestamp_diff_years', 'pe_timestamp_known_bad',
-        'pe_num_tls_callbacks', 'pe_overlay_size', 'pe_overlay_entropy', 'pe_imphash', 'pe_exphash',
+        'pe_linker_major_version', 'pe_linker_minor_version', 'pe_timestamp_known_bad',
+        'pe_has_dynamic_base', 'pe_has_nx', 'pe_has_seh', 'pe_section_alignment', 'pe_file_alignment',
+        'pe_num_tls_callbacks', 'pe_overlay_size', 'pe_overlay_entropy', 'pe_has_debug_info', 
+        'pe_has_delay_imports', 'pe_num_delay_imports', 'pe_imphash', 'pe_exphash',
         'pe_num_imports', 'pe_num_suspicious_imports', 'pe_imports_only_ordinals', 'pe_num_exports',
         'pe_has_com_exports', 'pe_num_resource_langs', 'pe_has_english_lang',
         'pe_has_suspicious_lang', 'pe_num_resources', 'pe_manifest_uac', 'pe_num_relocations',
         'pe_entrypoint_suspicious', 'pe_entrypoint_rwx_r', 'pe_entrypoint_rwx_w', 'pe_entrypoint_rwx_x',
+        'pe_entrypoint_in_last_section',
         'pe_num_sections', 'pe_section_avg_entropy', 'pe_section_low_entropy_present', 'pe_section_high_entropy_present',
         *[f'pe_section_ratio_{i}' for i in range(MAX_SECTION_RATIOS)],
+        'pe_section_names_hash',
         'pe_zero_size_sections', 'pe_executable_writable_sections', 'pe_is_dotnet', 'pe_rich_version_hash',
         'pe_rich_tooling_hash', 'pe_rich_num_tools', 'pe_rich_num_unique_tools', 'pe_rich_entropy',
         'pe_is_signed', 'pe_signature_expired',
+        'pe_max_resource_size', 'pe_max_resource_entropy',
         *[f'pe_reserved_{i}' for i in range(1, RESERVED_PER_BLOCK + 1)], # Reserved PE
 
         # --- ELF Specific Features ---
@@ -181,15 +192,25 @@ def define_feature_order(yara_rule_names):
         *[f'macho_reserved_{i}' for i in range(1, RESERVED_PER_BLOCK + 1)], # Reserved MachO
 
         # --- PDF Specific Features ---
-        'pdf_page_count', 'pdf_is_encrypted', 'pdf_obj_count', 'pdf_stream_count', 'pdf_image_count',
-        'pdf_font_count', 'pdf_embedded_file_count', 'pdf_javascript_present', 'pdf_launch_action_present',
-        'pdf_openaction_present', 'pdf_uri_count', 'pdf_avg_stream_entropy', 'pdf_metadata_hash',
-        *[f'pdf_reserved_{i}' for i in range(1, RESERVED_PER_BLOCK + 1)], # Reserved PDF
+        'pdf_page_count', 'pdf_is_encrypted', 'pdf_obj_count', 'pdf_stream_count',
+        'pdf_image_count', 'pdf_font_count', 'pdf_embedded_file_count',
+        'pdf_javascript_present', 'pdf_launch_action_present', 'pdf_openaction_present',
+        'pdf_uri_count', 'pdf_avg_stream_entropy', 'pdf_metadata_hash',
+        'pdf_total_char_count', 'pdf_total_stream_length', 'pdf_qrcode_like_patterns',
+        'pdf_min_stream_entropy', 'pdf_max_stream_entropy', 'pdf_mean_bw_ratio',
+        *[f'pdf_reserved_{i}' for i in range(1, RESERVED_PER_BLOCK + 1)],  # Reserved PDF
 
         # --- Script Specific Features ---
-        'script_line_count', 'script_avg_line_length', 'script_max_line_length', 'script_keyword_eval_count',
-        'script_keyword_exec_count', 'script_keyword_http_count', 'script_keyword_socket_count',
-        'script_obfuscation_indicator_longlines', 'script_obfuscation_indicator_entropy',
+        'script_line_count', 'script_avg_line_length', 'script_max_line_length', 'script_obfuscation_longlines',
+        'script_indent_abuse_ratio', 'script_comment_ratio', 'script_entropy', 'script_high_entropy_flag',
+        'script_nonascii_char_count', 'script_nonascii_ratio', 'script_char_freq_skew', 'script_eval',
+        'script_exec', 'script_base64', 'script_http', 'script_socket',
+        'script_download', 'script_fileio', 'script_reflect', 'script_spawn',
+        'script_concat_payloads', 'ps_encodedcommand', 'ps_bypass', 'ps_obfuscation',
+        'vbs_createobject', 'js_fromcharcode', 'js_document_write', 'js_script_injection',
+        'sh_reverse_shell', 'sh_env_mod', 'sh_shebang', 'script_semicolon_density',
+        'script_brace_density', 'script_paren_density', 'script_obfuscation_score', 'script_delivery_indicator',
+        'script_reflection_indicator',
         *[f'script_reserved_{i}' for i in range(1, RESERVED_PER_BLOCK + 1)], # Reserved Script
 
         # --- Add blocks for other types (Archive, Office, Image, etc.) here ---
@@ -284,13 +305,31 @@ def load_yara_rules_from_directory(rule_dir):
 
 @timer
 def run_yara_rules(raw_bytes, compiled_rules, filepath_for_logging="<memory>"):
-    """Matches compiled YARA rules against file content bytes."""
+    """Matches compiled YARA rules against file content bytes, potentially truncated."""
     rule_hits = {} # Dictionary to store rule_name: hit (0 or 1)
     if not compiled_rules or not raw_bytes: # Added check for raw_bytes
         logger.warning(f"Skipping YARA scan for {filepath_for_logging}: No rules or empty content.")
         return rule_hits
+
+    scan_data = raw_bytes
+    original_size = len(raw_bytes)
+    # Use the constant defined earlier
+    scan_limit = MAX_YARA_SCAN # <<< USE THE CONSTANT
+    was_truncated = False # Flag to track truncation for logging
+
+    # Check if truncation is needed
+    if original_size > scan_limit:
+        logger.debug(f"YARA scan data for {filepath_for_logging} truncated from {original_size} to {scan_limit} bytes.")
+        scan_data = raw_bytes[:scan_limit] # <<< SLICE THE DATA
+        was_truncated = True
+    else:
+        logger.debug(f"YARA scanning full {original_size} bytes for {filepath_for_logging}.")
+
+
     try:
-        matches = compiled_rules.match(data=raw_bytes)
+        # Match against the (potentially truncated) data
+        matches = compiled_rules.match(data=scan_data) # <<< USE scan_data HERE
+
         # Convert matches to a set of hit rule names for quick lookup
         hit_names_set = {match.rule for match in matches}
         # Populate the dictionary based on ALL compiled rules
@@ -299,10 +338,13 @@ def run_yara_rules(raw_bytes, compiled_rules, filepath_for_logging="<memory>"):
             rule_hits[rule_name] = 1.0 if rule_name in hit_names_set else 0.0
     except yara.Error as e:
         # Log error with file path for context, use repr(e) for more detail potentially
-        logger.error(f"YARA match error on data from {filepath_for_logging}: {repr(e)}")
+        # Include whether data was truncated in the error message
+        truncated_msg = f"(truncated to {scan_limit})" if was_truncated else "(full scan)" # <<< ADDED TRUNCATION INFO
+        logger.error(f"YARA match error on data from {filepath_for_logging} {truncated_msg}: {repr(e)}")
         # Return empty dict, main orchestrator will handle defaults
     except Exception as e:
-        logger.error(f"Unexpected error during YARA scan for {filepath_for_logging}: {e}", exc_info=True) # Added exc_info
+        truncated_msg = f"(truncated to {scan_limit})" if was_truncated else "(full scan)" # <<< ADDED TRUNCATION INFO
+        logger.error(f"Unexpected error during YARA scan for {filepath_for_logging} {truncated_msg}: {e}", exc_info=True) # Added exc_info
 
     return rule_hits
 
@@ -315,7 +357,6 @@ def safe_str_hash(text, modulus=10007):
     # Make it stable across runs and positive
     return abs(hash(text)) % modulus
 
-@timer
 def count_resources(resource_node):
      """Recursively counts resource nodes (directories and data)."""
      if not resource_node:
@@ -347,6 +388,11 @@ def extract_entrypoint_bytes_mean(binary, byte_count=1024):
              logger.warning(f"Entry point address is 0 for {type(binary)}. Cannot read entrypoint bytes.")
              return ep_bytes, mean
 
+        # Check for weirdly high entry point VA (heuristic)
+        if ep > 0x7FFFFFFF:  # Adjust threshold as needed
+            logger.debug(f"Suspiciously high entry point VA: 0x{ep:X}. Returning negative mean.")
+            return ep_bytes, -1.0
+
         # get_content_from_virtual_address works for PE, ELF, MachO
         ep_bytes_list = binary.get_content_from_virtual_address(ep, byte_count)
 
@@ -360,7 +406,7 @@ def extract_entrypoint_bytes_mean(binary, byte_count=1024):
                  logger.warning(f"Conversion to bytes resulted in empty data for entry point 0x{ep:X}.")
                  mean = 0.0
         else:
-            logger.warning(f"Could not read bytes from entry point VA 0x{ep:X}. Using default mean 0.0.")
+            logger.debug(f"Could not read bytes from entry point VA 0x{ep:X}. Using default mean 0.0.")
             mean = 0.0
 
     except AttributeError:
@@ -444,15 +490,18 @@ def extract_opcode_features_py(byte_code, top_n=TOP_N_OPCODES, arch=capstone.CS_
 @timer
 def extract_string_features_py(content: bytes, max_scan_bytes=MAX_STRING_SCAN, suspicious_terms=SUSPICIOUS_TERMS_SET):
     """
-    Extracts string features similar to the Rust implementation.
+    Extracts string features using regex for faster searching and single-pass analysis.
     """
     string_features_dict = {}
+    # Use provided max_scan_bytes if content is larger
+    if len(content) > max_scan_bytes:
+         logger.debug(f"Content size ({len(content)}) exceeds max_scan_bytes ({max_scan_bytes}). Truncating for string analysis.")
+         content = content[:max_scan_bytes]
+    elif len(content) == 0:
+         logger.warning("Content is empty. Returning zero string features.")
+         return string_features_dict
 
     try:
-        if not content:
-            logger.warning(f"Content is empty. Returning zero string features.")
-            return string_features_dict
-
         # --- Initialize counters ---
         string_hits = 0
         url_count = 0
@@ -466,38 +515,32 @@ def extract_string_features_py(content: bytes, max_scan_bytes=MAX_STRING_SCAN, s
         exploit_target_keywords = 0
         malware_frameworks = 0
         c2_patterns = 0
+        string_count = 0 # Optional: Count how many strings are processed
         # --- End counter initialization ---
 
-        current_string_bytes = bytearray()
-        extracted_strings = []
+        # Regex to find sequences of 5 or more printable ASCII bytes (0x20 to 0x7E)
+        # Use re.finditer for memory efficiency - processes one match at a time
+        # The pattern needs to be bytes: b"[\x20-\x7E]{5,}"
+        string_finder_regex = re.compile(b"[\x20-\x7E]{5,}")
 
-        # Extract printable ASCII strings (>= 5 chars)
-        for byte in content:
-            if 32 <= byte <= 126: # Printable ASCII range
-                current_string_bytes.append(byte)
-            else:
-                if len(current_string_bytes) >= 5:
-                    extracted_strings.append(bytes(current_string_bytes)) # Store as bytes
-                    if len(current_string_bytes) > longest_string:
-                        longest_string = len(current_string_bytes)
-                current_string_bytes.clear()
-        # Handle string at EOF
-        if len(current_string_bytes) >= 5:
-             extracted_strings.append(bytes(current_string_bytes))
-             if len(current_string_bytes) > longest_string:
-                 longest_string = len(current_string_bytes)
+        for match in string_finder_regex.finditer(content):
+            string_count += 1
+            s_bytes = match.group(0) # Get the matched bytes sequence
 
-        logger.debug(f"Extracted {len(extracted_strings)} strings (>=5 chars) from first {len(content)} bytes.")
+            # Update longest string length found so far
+            current_len = len(s_bytes)
+            if current_len > longest_string:
+                longest_string = current_len
 
-        # Analyze extracted strings
-        for s_bytes in extracted_strings:
+            # --- Analyze the found string immediately ---
             try:
                 # Decode carefully, ignoring errors, convert to lower
+                # This decode step is still necessary for text-based matching
                 s_lower = s_bytes.decode('ascii', errors='ignore').lower()
                 if not s_lower: continue # Skip if decoding results in empty string
 
                 # Check against suspicious terms set
-                # Use intersection for efficiency if set is large, or simple loop
+                # This loop remains, optimize if SUSPICIOUS_TERMS_SET is huge (e.g., Aho-Corasick)
                 hit_found = False
                 for term in suspicious_terms:
                     if term in s_lower:
@@ -505,12 +548,10 @@ def extract_string_features_py(content: bytes, max_scan_bytes=MAX_STRING_SCAN, s
                         hit_found = True
                         break # Count first hit per string only
 
-                # Other checks using regex or string methods
+                # Other checks using regex or string methods (applied to s_lower)
                 if URL_REGEX.search(s_lower): url_count += 1
                 if IP_REGEX.search(s_lower): ip_count += 1
-                # Check base64-like - use regex or Rust's simpler check
-                # if BASE64_LIKE_REGEX.match(s_lower): base64_like += 1
-                # Rust's check: >= 16 chars, all alphanumeric or +/=
+                # Base64-like check
                 if len(s_lower) >= 16 and all(c.isalnum() or c in '+/=' for c in s_lower): base64_like += 1
                 if s_lower.endswith(".pdb"): pdb_count += 1
                 if USER_AGENT_REGEX.search(s_lower): user_agent_count += 1
@@ -521,27 +562,43 @@ def extract_string_features_py(content: bytes, max_scan_bytes=MAX_STRING_SCAN, s
                 if C2_PATTERN_REGEX.search(s_lower): c2_patterns += 1
 
             except Exception as decode_err:
-                logger.warning(f"Could not decode or process string chunk: {decode_err}")
-                continue # Skip this string chunk if decoding fails badly
+                # Log error for this specific string, but continue with others
+                logger.warning(f"Could not decode or process string chunk: {decode_err} - String bytes (preview): {s_bytes[:100]}...")
+                continue
+            # --- End analysis for this string ---
 
+        logger.debug(f"Analyzed {string_count} strings (>=5 printable chars) within first {len(content)} bytes.")
 
+        # --- Populate the dictionary ---
         string_features_dict['string_suspicious_hits'] = float(string_hits)
         string_features_dict['string_url_count'] = float(url_count)
         string_features_dict['string_ip_count'] = float(ip_count)
-        string_features_dict['string_base64_count'] = float(base64_like) # Ensure base64_like counter exists
+        string_features_dict['string_base64_count'] = float(base64_like)
         string_features_dict['string_pdb_count'] = float(pdb_count)
         string_features_dict['string_user_agent_count'] = float(user_agent_count)
         string_features_dict['string_longest_len'] = float(longest_string)
-        string_features_dict['string_powershell_encoded_count'] = float(powershell_encoded) # Ensure counter exists
-        string_features_dict['string_shadow_copy_delete_count'] = float(shadow_copy_deletion) # Ensure counter exists
-        string_features_dict['string_exploit_keyword_count'] = float(exploit_target_keywords) # Ensure counter exists
-        string_features_dict['string_malware_framework_count'] = float(malware_frameworks) # Ensure counter exists
-        string_features_dict['string_c2_pattern_count'] = float(c2_patterns) # Ensure counter exists
+        string_features_dict['string_powershell_encoded_count'] = float(powershell_encoded)
+        string_features_dict['string_shadow_copy_delete_count'] = float(shadow_copy_deletion)
+        string_features_dict['string_exploit_keyword_count'] = float(exploit_target_keywords)
+        string_features_dict['string_malware_framework_count'] = float(malware_frameworks)
+        string_features_dict['string_c2_pattern_count'] = float(c2_patterns)
 
         logger.debug("String feature extraction completed.")
 
     except Exception as e:
         logger.error(f"Error during string feature extraction: {e}", exc_info=True)
+        # Return empty or zeroed dict on major failure? Current returns partially filled if error is late.
+        # Let's ensure all keys exist even if initialized to 0 on error
+        default_keys = [
+            'string_suspicious_hits', 'string_url_count', 'string_ip_count',
+            'string_base64_count', 'string_pdb_count', 'string_user_agent_count',
+            'string_longest_len', 'string_powershell_encoded_count',
+            'string_shadow_copy_delete_count', 'string_exploit_keyword_count',
+            'string_malware_framework_count', 'string_c2_pattern_count'
+        ]
+        for key in default_keys:
+            string_features_dict.setdefault(key, 0.0)
+
 
     return string_features_dict
 
@@ -758,6 +815,36 @@ def find_entry_section(binary):
         logger.debug(f"Found entry section: {entry_section.name} (VA: 0x{entry_section.virtual_address + image_base:X}, Size: 0x{entry_section.virtual_size:X})")
     return entry_section
 
+def find_resource_data_nodes(resource_node):
+    """
+    Recursively traverses the LIEF PE resource tree starting from resource_node
+    and returns a list of all ResourceData node contents (as bytes).
+    """
+    data_contents = []
+    if resource_node is None:
+        return data_contents
+
+    # Check if it's a data node (leaf)
+    if isinstance(resource_node, lief.PE.ResourceData):
+        try:
+            # Ensure content is bytes
+            content = bytes(resource_node.content)
+            data_contents.append(content)
+        except Exception as e:
+            logger.warning(f"Could not get content from ResourceData node: {e}")
+        return data_contents
+
+    # Check if it's a directory node
+    if isinstance(resource_node, lief.PE.ResourceDirectory):
+        # Recursively process children
+        for child in resource_node.childs:
+            data_contents.extend(find_resource_data_nodes(child))
+        return data_contents
+
+    # If it's neither (shouldn't typically happen unless root is weird)
+    logger.warning(f"Unexpected node type in resource tree: {type(resource_node)}")
+    return data_contents
+
 @timer
 def extract_features_pe(path, raw_bytes, binary):
     """
@@ -776,14 +863,41 @@ def extract_features_pe(path, raw_bytes, binary):
         features['pe_checksum'] = float(oh.checksum)
         features['pe_sizeof_code'] = float(oh.sizeof_code)
         features['pe_machine'] = float(hdr.machine.value)
+        features['pe_subsystem'] = float(oh.subsystem.value) if hasattr(oh.subsystem, 'value') else -1.0 # Use enum value or -1 if missing
         features['pe_dll_characteristics'] = float(oh.dll_characteristics)
         features['pe_linker_major_version'] = float(oh.major_linker_version)
         features['pe_linker_minor_version'] = float(oh.minor_linker_version)
 
+        # Default values in case of errors or missing attribute
+        features['pe_has_dynamic_base'] = -1.0
+        features['pe_has_nx'] = -1.0
+        features['pe_has_seh'] = -1.0
+
+        if not hasattr(oh, 'dll_characteristics'):
+            logger.warning(f"Optional header for {path} lacks 'dll_characteristics' attribute.")
+        else:
+            # If attribute exists, try calculating the flags using manual bitmasks
+            try:
+                dll_char = oh.dll_characteristics
+
+                # Check if DYNAMIC_BASE (ASLR) flag is set
+                features['pe_has_dynamic_base'] = float((dll_char & DLL_CHARACTERISTICS_DYNAMIC_BASE) != 0)
+
+                # Check if NX_COMPAT (DEP) flag is set
+                features['pe_has_nx'] = float((dll_char & DLL_CHARACTERISTICS_NX_COMPAT) != 0)
+
+                # Check if NO_SEH flag is NOT set (meaning SEH is likely enabled)
+                features['pe_has_seh'] = float((dll_char & DLL_CHARACTERISTICS_NO_SEH) == 0)
+
+            except Exception as flag_err:
+                logger.warning(f"Error calculating DLL characteristics flags even though attribute exists: {flag_err}")
+                # Defaults are already set above
+
+        features['pe_section_alignment'] = float(oh.section_alignment)
+        features['pe_file_alignment'] = float(oh.file_alignment)
+
         # --- Timestamp ---
         timestamp_year = datetime.fromtimestamp(hdr.time_date_stamps, timezone.utc).year if hdr.time_date_stamps else 1970
-        current_year = datetime.now(timezone.utc).year
-        features['pe_timestamp_diff_years'] = float(current_year - timestamp_year)
         features['pe_timestamp_known_bad'] = float(timestamp_year in {1992, 2007, 2040}) # Example known bad years
 
         # --- TLS ---
@@ -805,6 +919,18 @@ def extract_features_pe(path, raw_bytes, binary):
                  logger.warning(f"Could not calculate overlay for {path}: {ov_err}")
         features['pe_overlay_size'] = float(overlay_size)
         features['pe_overlay_entropy'] = float(overlay_entropy)
+
+        features['pe_has_debug_info'] = float(binary.has_debug)
+
+        has_delay = binary.has_delay_imports
+        features['pe_has_delay_imports'] = float(has_delay)
+        num_delay = 0.0
+        if has_delay:
+             try:
+                  num_delay = float(len(binary.delay_imports))
+             except Exception as delay_err:
+                  logger.warning(f"Could not count delay imports: {delay_err}")
+        features['pe_num_delay_imports'] = num_delay
 
         # --- Imports / Exports ---
         imphash, exphash, num_imports, suspicious_count, uses_only_ordinals, export_count, com_export = extract_imports_and_exports(binary)
@@ -833,7 +959,6 @@ def extract_features_pe(path, raw_bytes, binary):
                  manifest_uac = 0.0 # Default if error
         features['pe_manifest_uac'] = float(manifest_uac)
 
-
         # --- Relocations ---
         features['pe_num_relocations'] = float(check_relocation_table(binary))
 
@@ -841,7 +966,6 @@ def extract_features_pe(path, raw_bytes, binary):
         features['pe_entrypoint_suspicious'] = float(check_entry_point(binary)) # Check if EP is far from image base
 
         # --- Entry Point RWX flags ---
-        # NOTE: This ALSO relies on section characteristics check below. If that fails, these will be 0.
         entry_section = find_entry_section(binary)
         rwx_flags = [0.0, 0.0, 0.0]
         if entry_section:
@@ -861,14 +985,73 @@ def extract_features_pe(path, raw_bytes, binary):
             except Exception as entry_char_err:
                  logger.warning(f"Error checking entry section characteristics: {entry_char_err}")
         else:
-            logger.warning(f"Could not find entry point section for {path}. Cannot determine RWX.") # Log if section not found
+            logger.debug(f"Could not find entry point section for {path}. Cannot determine RWX.") # Log if section not found
         features['pe_entrypoint_rwx_r'] = rwx_flags[0]
         features['pe_entrypoint_rwx_w'] = rwx_flags[1]
         features['pe_entrypoint_rwx_x'] = rwx_flags[2]
 
+        pe_entrypoint_in_last_section = 0.0
+        if binary.sections:
+            try:
+                # Find the section with the highest physical end offset
+                # Ensure sections have offset and size attributes before sorting
+                valid_sections = [s for s in binary.sections if hasattr(s, 'offset') and hasattr(s, 'size')]
+                if valid_sections:
+                    last_section_by_offset = max(valid_sections, key=lambda s: s.offset + s.size)
+                    ep_rva = binary.entrypoint
+                    section_start_rva = last_section_by_offset.virtual_address
+                    # Use virtual_size for RVA range check
+                    section_end_rva = section_start_rva + last_section_by_offset.virtual_size
+
+                    # Check if entry point RVA falls within this last section's RVA range
+                    if section_start_rva <= ep_rva < section_end_rva:
+                        pe_entrypoint_in_last_section = 1.0
+                        logger.debug(f"Entry point 0x{ep_rva:X} is within the last physical section '{last_section_by_offset.name}' (RVA range 0x{section_start_rva:X} - 0x{section_end_rva:X})")
+                    else:
+                        logger.debug(f"Entry point 0x{ep_rva:X} is NOT within the last physical section '{last_section_by_offset.name}' (RVA range 0x{section_start_rva:X} - 0x{section_end_rva:X})")
+                else:
+                    logger.warning("No valid sections found with offset/size attributes to determine the last one.")
+
+            except AttributeError as ae:
+                logger.warning(f"Attribute error determining if entry point is in last section (maybe missing section property?): {ae}")
+            except Exception as last_sec_err:
+                 ogger.warning(f"Could not determine if entry point is in last section: {last_sec_err}")
+        else:
+            logger.warning("No sections found, cannot determine if entry point is in last section.")
+
+        features['pe_entrypoint_in_last_section'] = pe_entrypoint_in_last_section
+
         # --- Sections ---
         num_sections = len(binary.sections)
         features['pe_num_sections'] = float(num_sections)
+
+        section_names_str = ""
+        if binary.sections:
+            try:
+                # Get names, handling potential decoding issues
+                section_names_list = []
+                for s in binary.sections:
+                    try:
+                        # LIEF section names are usually strings, but be safe
+                        name = s.name
+                        if isinstance(name, bytes):
+                            name = name.decode('utf-8', errors='ignore')
+                        section_names_list.append(name)
+                    except Exception as name_err:
+                            logger.warning(f"Could not get/decode name for a section: {name_err}. Skipping name.")
+                            section_names_list.append("?") # Placeholder for problematic names
+
+                section_names_str = "|".join(section_names_list) # Join with a delimiter
+                logger.debug(f"Section names string for hashing: '{section_names_str}'")
+            except Exception as sec_name_err:
+                logger.warning(f"Could not get all section names: {sec_name_err}")
+                section_names_str = "" # Fallback to empty string on error
+        else:
+            logger.debug("No sections found for name hashing.")
+
+        # Use the existing safe_str_hash function
+        features['pe_section_names_hash'] = float(safe_str_hash(section_names_str))
+
         section_entropies = [] # List to store entropy of sections with content
         section_ratios = []    # List to store physical/virtual size ratio
         zero_size_sections = 0 # Counter for sections with physical size 0
@@ -991,6 +1174,43 @@ def extract_features_pe(path, raw_bytes, binary):
         features['pe_is_signed'] = float(binary.has_signatures)
         features['pe_signature_expired'] = 0.0 # Placeholder
 
+        max_res_size = 0.0
+        max_res_entropy = 0.0
+        largest_resource_data = None # To store the bytes of the largest resource
+
+        if binary.has_resources and binary.resources: # Check binary.resources directly
+             try:
+                 # Use the helper function to get all data blobs
+                 all_resource_data = find_resource_data_nodes(binary.resources)
+                 logger.debug(f"Found {len(all_resource_data)} resource data nodes.")
+
+                 # Find the largest data blob
+                 for data_bytes in all_resource_data:
+                     current_size = len(data_bytes)
+                     if current_size > max_res_size:
+                         max_res_size = current_size
+                         largest_resource_data = data_bytes # Keep the actual bytes
+
+                 # Calculate entropy if we found a largest resource
+                 if largest_resource_data:
+                     max_res_entropy = entropy(largest_resource_data) # Assumes your entropy function handles bytes
+                     logger.debug(f"Max resource size: {max_res_size}, Entropy: {max_res_entropy:.4f}")
+                 else:
+                     logger.debug("No resource data found to calculate max size/entropy.")
+
+
+             except Exception as res_err:
+                 logger.warning(f"Error processing resource tree for size/entropy: {res_err}")
+                 # Ensure defaults remain 0 if error occurs during processing
+                 max_res_size = 0.0
+                 max_res_entropy = 0.0
+        else:
+            logger.debug("No resources found in binary.")
+
+
+        features['pe_max_resource_size'] = float(max_res_size)
+        features['pe_max_resource_entropy'] = float(max_res_entropy)
+
         logger.debug(f"PE Feature Dict Extraction {path} completed in {time.time() - start_time:.2f}s. Found {len(features)} PE features.")
         return features # <<< Return the dictionary
 
@@ -1041,68 +1261,159 @@ def extract_macho_features(path, raw_bytes, binary): # Added path for logging
 
 @timer
 def extract_features_pdf(path, raw_bytes):
-    """Extracts features from PDF files."""
-    logger.info(f"Processing PDF {path}...")
-    features = {}
-    if not PDF_LIB_AVAILABLE:
-        logger.warning("PDF processing skipped: PyPDF2 library not available.")
-        return features
+    from PyPDF2 import PdfReader
+    from io import BytesIO
+
+    features = {
+        'pdf_page_count': 0.0,
+        'pdf_is_encrypted': 0.0,
+        'pdf_obj_count': 0.0,
+        'pdf_stream_count': 0.0,
+        'pdf_image_count': 0.0,
+        'pdf_font_count': 0.0,
+        'pdf_embedded_file_count': 0.0,
+        'pdf_javascript_present': 0.0,
+        'pdf_launch_action_present': 0.0,
+        'pdf_openaction_present': 0.0,
+        'pdf_uri_count': 0.0,
+        'pdf_avg_stream_entropy': 0.0,
+        'pdf_metadata_hash': 0.0,
+        'pdf_total_char_count': 0.0,
+        'pdf_total_stream_length': 0.0,
+        'pdf_qrcode_like_patterns': 0.0,
+        'pdf_high_black_white_ratio': 0.0,
+        'pdf_min_stream_entropy': 8.0,
+        'pdf_max_stream_entropy': 0.0,
+        'pdf_mean_bw_ratio': 0.0
+    }
 
     try:
-        reader = PyPDF2.PdfReader(path) # PyPDF2 needs path, not bytes usually
-        metadata = reader.metadata
-        num_pages = len(reader.pages)
-
-        features['pdf_page_count'] = float(num_pages)
+        reader = PdfReader(BytesIO(raw_bytes))
+        features['pdf_page_count'] = float(len(reader.pages))
         features['pdf_is_encrypted'] = float(reader.is_encrypted)
 
-        # Basic object counts (approximate with PyPDF2)
-        # TODO: Use PyMuPDF (fitz) for more accurate counts of streams, images, fonts, embedded files
-        features['pdf_obj_count'] = float(len(reader.objects)) # Indirect objects
-        features['pdf_stream_count'] = 0.0 # Placeholder
-        features['pdf_image_count'] = 0.0 # Placeholder
-        features['pdf_font_count'] = 0.0 # Placeholder
-        features['pdf_embedded_file_count'] = 0.0 # Placeholder
+        root = reader.trailer['/Root']
+        if hasattr(root, 'get_object'):
+            root = root.get_object()
+        if hasattr(root, 'keys'):
+            features['pdf_obj_count'] = float(len(root.keys()))
 
-        # TODO: Implement checks for JS, Launch Actions, OpenAction, URIs by traversing objects/pages
-        # PyMuPDF is generally better suited for this detailed analysis.
-        features['pdf_javascript_present'] = 0.0 # Placeholder
-        features['pdf_launch_action_present'] = 0.0 # Placeholder
-        features['pdf_openaction_present'] = 0.0 # Placeholder
-        features['pdf_uri_count'] = 0.0 # Placeholder
+        if '/OpenAction' in root:
+            features['pdf_openaction_present'] = 1.0
+        if '/Names' in root:
+            names = root['/Names']
+            if hasattr(names, 'get_object'):
+                names = names.get_object()
+            if '/JavaScript' in names:
+                features['pdf_javascript_present'] = 1.0
+            if '/EmbeddedFiles' in names:
+                embedded_files = names['/EmbeddedFiles']
+                if hasattr(embedded_files, 'get_object'):
+                    embedded_files = embedded_files.get_object()
+                if '/Names' in embedded_files:
+                    features['pdf_embedded_file_count'] = float(len(embedded_files['/Names']) // 2)
 
-        # Metadata hash
-        meta_text = ""
-        if metadata:
-            meta_text += metadata.author or ""
-            meta_text += metadata.creator or ""
-            meta_text += metadata.producer or ""
-            meta_text += metadata.subject or ""
-            meta_text += metadata.title or ""
-        features['pdf_metadata_hash'] = float(safe_str_hash(meta_text))
+        bw_ratios = []
 
-        # TODO: Implement stream extraction and entropy calculation using PyMuPDF
-        features['pdf_avg_stream_entropy'] = 0.0 # Placeholder
+        for page in reader.pages:
+            page_resources = page.get('/Resources', {})
 
-    except PyPDF2.errors.PdfReadError as e:
-         logger.warning(f"PyPDF2 could not read PDF {path}: {e}")
-         return {}
+            if '/XObject' in page_resources:
+                xobjects = page_resources['/XObject']
+                if hasattr(xobjects, 'get_object'):
+                    xobjects = xobjects.get_object()
+                features['pdf_stream_count'] += len(xobjects)
+                for obj in xobjects.values():
+                    if hasattr(obj, 'get_object'):
+                        obj = obj.get_object()
+                    if obj.get('/Subtype') == '/Image':
+                        features['pdf_image_count'] += 1
+
+                    try:
+                        data = obj.get_data()
+                        if data:
+                            import math
+                            from collections import Counter
+                            counter = Counter(data)
+                            total = len(data)
+                            entropy = -sum(count / total * math.log2(count / total) for count in counter.values())
+                            features['pdf_avg_stream_entropy'] += entropy
+                            features['pdf_total_stream_length'] += float(total)
+
+                            features['pdf_min_stream_entropy'] = min(features['pdf_min_stream_entropy'], entropy)
+                            features['pdf_max_stream_entropy'] = max(features['pdf_max_stream_entropy'], entropy)
+
+                            values = list(counter.values())
+                            if values:
+                                mean = sum(values) / len(values)
+                                stddev = math.sqrt(sum((x - mean) ** 2 for x in values) / len(values))
+                                if stddev < mean * 0.1:
+                                    features['pdf_high_black_white_ratio'] += 1.0
+
+                            # QR-like heuristic: count black/white alternation in binary image data
+                            if len(set(data[:100])) <= 2 and entropy > 4.0:
+                                features['pdf_qrcode_like_patterns'] = 1.0
+
+                            bw_ratio = min(counter.get(0, 0), counter.get(255, 0)) / max(counter.get(0, 1), counter.get(255, 1))
+                            bw_ratios.append(bw_ratio)
+
+                    except Exception:
+                        pass
+
+            if '/Font' in page_resources:
+                fonts = page_resources['/Font']
+                if hasattr(fonts, 'get_object'):
+                    fonts = fonts.get_object()
+                features['pdf_font_count'] += len(fonts)
+
+            if '/Annots' in page:
+                annotations = page['/Annots']
+                for annot in annotations:
+                    if hasattr(annot, 'get_object'):
+                        annot_obj = annot.get_object()
+                        if annot_obj.get('/A', {}).get('/URI'):
+                            features['pdf_uri_count'] += 1
+                        if annot_obj.get('/A', {}).get('/S') == '/Launch':
+                            features['pdf_launch_action_present'] = 1.0
+
+            try:
+                extracted_text = page.extract_text()
+                if extracted_text:
+                    features['pdf_total_char_count'] += float(len(extracted_text))
+            except Exception:
+                pass
+
+        if features['pdf_stream_count'] > 0:
+            features['pdf_avg_stream_entropy'] /= features['pdf_stream_count']
+
+        if bw_ratios:
+            features['pdf_mean_bw_ratio'] = float(sum(bw_ratios) / len(bw_ratios))
+
+        try:
+            import hashlib
+            metadata = reader.metadata
+            if metadata:
+                meta_str = str(metadata)
+                features['pdf_metadata_hash'] = float(int(hashlib.md5(meta_str.encode()).hexdigest(), 16) % 1e8)
+        except Exception:
+            pass
+
     except Exception as e:
-        logger.error(f"Error processing PDF {path}: {e}", exc_info=True)
-        return {}
+        logger.error(f"Error extracting PDF features from {path}: {type(e).__name__}: {e}")
+
     return features
 
 @timer
 def extract_features_script(path, raw_bytes):
-    """Extracts features from generic script files."""
+    """Extracts robust static features from script files (VBS, JS, PowerShell, BAT, Bash) for ML classifiers."""
     logger.info(f"Processing Script {path}...")
     features = {}
-    script_content = "" # Initialize
+    script_content = ""
+
     try:
-        # Try decoding with common encodings
+        # --- Smart decoding ---
         decoded = False
-        encodings_to_try = ['utf-8', 'latin-1', 'cp1252']
-        for enc in encodings_to_try:
+        for enc in ['utf-8', 'latin-1', 'cp1252']:
             try:
                 script_content = raw_bytes.decode(enc)
                 logger.debug(f"Decoded script {path} using {enc}")
@@ -1111,333 +1422,479 @@ def extract_features_script(path, raw_bytes):
             except UnicodeDecodeError:
                 continue
         if not decoded:
-             # Fallback: Decode ignoring errors - may lose info but better than failing
-             script_content = raw_bytes.decode('utf-8', errors='ignore')
-             logger.warning(f"Could not decode script {path} cleanly, used fallback.")
+            script_content = raw_bytes.decode('utf-8', errors='ignore')
+            logger.warning(f"Used fallback decoding for script {path}")
 
+        script_lower = script_content.lower()
         lines = script_content.splitlines()
         num_lines = len(lines)
+        line_lengths = [len(line) for line in lines]
+
+        # --- Structural indicators ---
         features['script_line_count'] = float(num_lines)
-        if num_lines > 0:
-             line_lengths = [len(line) for line in lines]
-             features['script_avg_line_length'] = float(np.mean(line_lengths))
-             features['script_max_line_length'] = float(np.max(line_lengths))
-             features['script_obfuscation_indicator_longlines'] = float(np.max(line_lengths) > 1000) # Example threshold
+        features['script_avg_line_length'] = float(np.mean(line_lengths)) if line_lengths else 0.0
+        features['script_max_line_length'] = float(np.max(line_lengths)) if line_lengths else 0.0
+        features['script_obfuscation_longlines'] = float(np.max(line_lengths) > 1000)
+        features['script_indent_abuse_ratio'] = float(sum(1 for l in lines if l.startswith('    '*5)) / num_lines) if num_lines else 0.0
+        features['script_comment_ratio'] = float(sum(1 for l in lines if l.strip().startswith(('#', '//', 'REM', "'"))) / num_lines) if num_lines else 0.0
+
+        # --- Entropy-based detection ---
+        ent = entropy(raw_bytes)
+        features['script_entropy'] = float(ent)
+        features['script_high_entropy_flag'] = float(ent > 6.0)
+
+        # --- Non-ASCII & homoglyph ratio ---
+        non_ascii = sum(1 for c in script_content if ord(c) > 127)
+        features['script_nonascii_char_count'] = float(non_ascii)
+        features['script_nonascii_ratio'] = float(non_ascii / len(script_content)) if script_content else 0.0
+
+        # --- High-frequency character skew (ASCII Art / packed blobs) ---
+        ascii_only = ''.join(c for c in script_content if ord(c) < 128)
+        freq = Counter(ascii_only)
+        if freq:
+            total = sum(freq.values())
+            top = freq.most_common(1)[0][1]
+            features['script_char_freq_skew'] = float(top / total)
         else:
-             features['script_avg_line_length'] = 0.0
-             features['script_max_line_length'] = 0.0
-             features['script_obfuscation_indicator_longlines'] = 0.0
+            features['script_char_freq_skew'] = 0.0
 
-        # Keyword counts (case-insensitive, use word boundaries for less false positives)
-        script_lower = script_content.lower()
-        features['script_keyword_eval_count'] = float(len(re.findall(r'\beval\b', script_lower)))
-        features['script_keyword_exec_count'] = float(len(re.findall(r'\bexec\b', script_lower))) # Python exec
-        features['script_keyword_http_count'] = float(len(re.findall(r'http[s]?://', script_lower)))
-        features['script_keyword_socket_count'] = float(len(re.findall(r'\bsocket\b', script_lower)))
-        # TODO: Add more script-language specific keywords (e.g., CreateObject for VBS, require for JS/Node)
+        # --- Language-specific suspicious keywords ---
+        patterns = {
+            # Common / multi-language
+            'script_eval': r'\beval\b',
+            'script_exec': r'\bexec\b|\bExecute\b|\bInvoke-Expression\b',
+            'script_base64': r'base64',
+            'script_http': r'http[s]?://',
+            'script_socket': r'\bsocket\b|\bnc\b|\bncat\b',
+            'script_download': r'downloadstring|wget|curl|invoke-webrequest',
+            'script_fileio': r'read|write|open|close|CreateTextFile|OpenTextFile',
+            'script_reflect': r'\bReflect\b|\bAdd-Type\b',
+            'script_spawn': r'\bspawn\b|\bsystem\b|\bpopen\b|\bos\.system\b',
+            'script_concat_payloads': r'\+.{0,10}\+|&.{0,10}&',
 
-        # Entropy based obfuscation (use raw bytes entropy calculated earlier)
-        # Compare general entropy to typical text entropy (~4.5 for English)
-        general_entropy = entropy(raw_bytes) # Re-calc or pass from main? Pass is better. Assuming passed as arg eventually.
-        features['script_obfuscation_indicator_entropy'] = float(general_entropy > 6.0) # Example threshold for high entropy script
+            # PowerShell
+            'ps_encodedcommand': r'-enc(odedcommand)?\s+[a-z0-9+/=]+',
+            'ps_bypass': r'\b-bypass\b|\bExecutionPolicy\b',
+            'ps_obfuscation': r'\bNew-Object\b|\bFromBase64String\b',
 
-        # TODO: Consider AST parsing for Python/JS for deeper analysis
-        # TODO: Consider character frequency analysis
+            # VBS / JS
+            'vbs_createobject': r'\bCreateObject\b',
+            'js_fromcharcode': r'fromcharcode',
+            'js_document_write': r'document\.write',
+            'js_script_injection': r'setattribute\s*\(\s*[\'"]src',
+
+            # Batch / Shell
+            'sh_reverse_shell': r'nc .* -e|bash -i >& /dev',
+            'sh_env_mod': r'export\s+[A-Z_]+=',
+            'sh_shebang': r'^#!',
+        }
+
+        for name, regex in patterns.items():
+            features[name] = float(len(re.findall(regex, script_lower)))
+
+        # --- Obfuscation scoring / summarization ---
+        features['script_obfuscation_score'] = float(
+            features['script_eval'] +
+            features['script_exec'] +
+            features['script_concat_payloads'] +
+            features['script_base64'] +
+            features['ps_encodedcommand'] +
+            features['ps_bypass'] > 3
+        )
+
+        features['script_delivery_indicator'] = float(
+            features['script_http'] +
+            features['script_download'] +
+            features['script_fileio'] > 2
+        )
+
+        features['script_reflection_indicator'] = float(
+            features['script_reflect'] +
+            features['vbs_createobject'] +
+            features['ps_obfuscation'] > 2
+        )
+
+        # --- Script shape / density indicators ---
+        features['script_semicolon_density'] = float(script_content.count(';') / num_lines) if num_lines else 0.0
+        features['script_brace_density'] = float((script_content.count('{') + script_content.count('}')) / num_lines) if num_lines else 0.0
+        features['script_paren_density'] = float((script_content.count('(') + script_content.count(')')) / num_lines) if num_lines else 0.0
 
     except Exception as e:
         logger.error(f"Error processing script {path}: {e}", exc_info=True)
         return {}
+
+    return features
+
+
+# --- Helper function for file type fallback checks based on file suffix ---
+def file_suffix_fallback(path):
+    path_lower = path.lower()
+    if path_lower.endswith('.exe'):
+        return 'pe'
+    elif path_lower.endswith('.pdf'):
+        return 'pdf'
+    elif path_lower.endswith(('.py', '.js', '.vbs', '.sh', '.bat', '.ps1')):
+        return 'script'
+    else:
+        return 'generic'
+
+@timer
+def read_file_content(path):
+    """Reads file content and returns bytes and size."""
+    try:
+        with open(path, "rb") as f:
+            raw_bytes = f.read()
+        file_size = len(raw_bytes)
+        if file_size == 0:
+            logger.warning(f"File {path} is empty.")
+            return None, 0
+        logger.debug(f"Read {file_size} bytes from {path}")
+        return raw_bytes, file_size
+    except FileNotFoundError:
+        logger.error(f"File not found: {path}")
+        return None, 0
+    except OSError as e:
+        logger.error(f"OS error reading file {path}: {e}")
+        return None, 0
+    except Exception as e:
+        logger.error(f"Unexpected error reading file {path}: {e}", exc_info=True)
+        return None, 0
+
+@timer
+def calculate_general_features(raw_bytes, file_size):
+    """
+    Calculates general features based on raw file content.
+    Optimized: Limits frequency analysis and zlib compression for large files.
+    """
+    features = {}
+    freq = None
+    was_freq_truncated = False
+
+    # --- Size Bucket ---
+    # (This calculation is very fast, keep as is)
+    size_kb = file_size / 1024.0
+    if size_kb < 1: size_bucket = 0
+    elif size_kb < 10: size_bucket = 1
+    elif size_kb < 100: size_bucket = 2
+    elif size_kb < 1024: size_bucket = 3
+    elif size_kb < 10240: size_bucket = 4
+    elif size_kb < 102400: size_bucket = 5
+    else: size_bucket = 6
+    features['general_file_size_bucket'] = float(size_bucket)
+
+    # --- Initialize ---
+    features['general_entropy'] = 0.0
+    features['general_null_byte_freq'] = 0.0
+    features['general_printable_ascii_freq'] = 0.0
+    for i in range(MAX_ENTROPY_BUCKETS):
+         features[f'general_entropy_bucket_{i}'] = 0.0
+    # Default zlib: 0.0 for empty, -1.0 for error, -10.0 if skipped due to size
+    features['general_zlib_compress_ratio'] = 0.0 if file_size == 0 else -1.0
+
+    if file_size > 0:
+        # --- Determine data slice for Frequency Analysis ---
+        if file_size > MAX_FREQ_CALC_SIZE:
+            data_for_freq = raw_bytes[:MAX_FREQ_CALC_SIZE]
+            freq_calc_size = MAX_FREQ_CALC_SIZE
+            was_freq_truncated = True
+            logger.debug(f"Frequency analysis truncated to first {freq_calc_size} bytes (original: {file_size})")
+        else:
+            data_for_freq = raw_bytes
+            freq_calc_size = file_size
+            was_freq_truncated = False
+
+        # --- Frequency Array Calculation (on potentially truncated data) ---
+        try:
+             byte_buffer = np.frombuffer(data_for_freq, dtype=np.uint8)
+             freq = np.bincount(byte_buffer, minlength=256)
+        except Exception as freq_e:
+             logger.error(f"Error calculating byte frequencies: {freq_e}")
+             freq = None
+
+        # --- Features Derived from Frequency Array ---
+        if freq is not None:
+             # Use freq_calc_size as the correct total for probabilities/frequencies
+             total_for_freq_features = float(freq_calc_size)
+
+             # Entropy (approximation if truncated)
+             try:
+                 # Ensure we don't divide by zero if freq_calc_size somehow ended up 0
+                 if total_for_freq_features > 0:
+                     probs = freq[freq > 0] / total_for_freq_features
+                     features['general_entropy'] = -np.sum(probs * np.log2(probs))
+                 else:
+                     features['general_entropy'] = 0.0
+             except Exception as ent_e: logger.warning(f"Error calculating entropy: {ent_e}")
+
+             # Buckets (approximation if truncated)
+             try:
+                 if total_for_freq_features > 0:
+                     for i in range(MAX_ENTROPY_BUCKETS):
+                         start = i * (256 // MAX_ENTROPY_BUCKETS)
+                         end = (i + 1) * (256 // MAX_ENTROPY_BUCKETS)
+                         features[f'general_entropy_bucket_{i}'] = float(np.sum(freq[start:end]) / total_for_freq_features)
+                 # If total is 0, buckets remain 0.0 (initialized state)
+             except Exception as buck_e: logger.warning(f"Error calculating entropy buckets: {buck_e}")
+
+             # Byte Freqs (approximation if truncated)
+             try:
+                 if total_for_freq_features > 0:
+                     features['general_null_byte_freq'] = float(freq[0] / total_for_freq_features)
+             except IndexError: logger.warning("IndexError getting freq[0]")
+             except Exception as e: logger.warning(f"Error calculating null byte freq: {e}")
+             try:
+                 if total_for_freq_features > 0:
+                     features['general_printable_ascii_freq'] = float(np.sum(freq[32:127]) / total_for_freq_features)
+             except IndexError: logger.warning("IndexError summing freq[32:127]")
+             except Exception as e: logger.warning(f"Error calculating printable ASCII freq: {e}")
+        else:
+            logger.warning("Skipping frequency-derived features due to bincount error.")
+
+
+        # --- Conditional Zlib Compression (based on *original* file size) ---
+        if file_size <= MAX_ZLIB_COMPRESS_SIZE:
+            try:
+                compressed_bytes = zlib.compress(raw_bytes)
+                features['general_zlib_compress_ratio'] = float(len(compressed_bytes) / file_size)
+            except MemoryError:
+                logger.warning(f"MemoryError during zlib compression (size {file_size}). Ratio=-2.")
+                features['general_zlib_compress_ratio'] = -2.0
+            except zlib.error as z_err:
+                logger.warning(f"zlib error during compression: {z_err}. Ratio=-3.")
+                features['general_zlib_compress_ratio'] = -3.0
+            except Exception as e:
+                logger.warning(f"Unexpected zlib error: {e}. Ratio=-1.")
+                features['general_zlib_compress_ratio'] = -1.0
+        else:
+            # Skip compression for large files
+            logger.debug(f"Skipping zlib compression, file size {file_size} > limit {MAX_ZLIB_COMPRESS_SIZE}.")
+            features['general_zlib_compress_ratio'] = -10.0 # Use specific code for "skipped due to size"
+
+    # If file_size was 0, all relevant features are already 0.0
     return features
 
 @timer
+def identify_file_type_and_parse(path, raw_bytes):
+    """Identifies file type using Magic and attempts LIEF parsing if executable."""
+    magic_desc = ""
+    mime_type = "application/octet-stream" # Default
+    binary = None
+    file_type = "unknown" # e.g., 'pe', 'elf', 'macho', 'pdf', 'script', 'unknown'
+    mem_file = None
+
+    # --- Magic Detection ---
+    try:
+        if raw_bytes:
+             magic_desc = magic.from_buffer(raw_bytes).lower()
+             mime_type = magic.from_buffer(raw_bytes, mime=True)
+             logger.info(f"Magic: {magic_desc} | MIME: {mime_type}")
+        else:
+             logger.warning("Skipping magic detection for empty raw_bytes.")
+    except Exception as magic_err:
+        logger.warning(f"python-magic failed for {path}: {magic_err}")
+
+    # --- LIEF Parsing / Type Decision ---
+    try:
+        # Use MIME type first
+        if mime_type in ["application/x-dosexec", "application/x-msdownload", "application/vnd.microsoft.portable-executable"]:
+            logger.debug("Attempting PE parse based on MIME.")
+            mem_file = io.BytesIO(raw_bytes)
+            binary = lief.PE.parse(mem_file)
+            if binary is not None: file_type = 'pe'
+            else: logger.warning(f"LIEF PE parse failed despite MIME type for {path}")
+        elif mime_type == "application/x-elf":
+             logger.debug("Attempting ELF parse based on MIME.")
+             mem_file = io.BytesIO(raw_bytes)
+             binary = lief.ELF.parse(mem_file)
+             if binary is not None: file_type = 'elf'
+             else: logger.warning(f"LIEF ELF parse failed despite MIME type for {path}")
+        elif mime_type in ["application/x-mach-binary", "application/x-executable", "application/x-apple-binary"]:
+             logger.debug("Attempting MachO parse based on MIME.")
+             mem_file = io.BytesIO(raw_bytes)
+             binary = lief.MachO.parse(mem_file)
+             if binary is not None: file_type = 'macho'
+             else: logger.warning(f"LIEF MachO parse failed despite MIME type for {path}")
+        elif mime_type == "application/pdf":
+             file_type = 'pdf'
+        elif mime_type.startswith("text/") or mime_type in ["application/x-python", "application/javascript", "application/x-sh", "application/x-batch", "application/xml", "application/ecmascript"]:
+             file_type = 'script'
+        else:
+             # Fallback: Try generic LIEF parse
+             logger.debug(f"MIME type '{mime_type}' inconclusive, attempting generic LIEF parse...")
+             try:
+                 mem_file = io.BytesIO(raw_bytes)
+                 parsed_obj = lief.parse(mem_file) # Use generic parse
+                 if isinstance(parsed_obj, lief.PE.Binary):
+                     logger.debug("Generic LIEF parse identified PE.")
+                     binary = parsed_obj
+                     file_type = 'pe'
+                 elif isinstance(parsed_obj, lief.ELF.Binary):
+                     logger.debug("Generic LIEF parse identified ELF.")
+                     binary = parsed_obj
+                     file_type = 'elf'
+                 elif isinstance(parsed_obj, lief.MachO.Binary):
+                     logger.debug("Generic LIEF parse identified MachO.")
+                     binary = parsed_obj
+                     file_type = 'macho'
+                 # Add other types if lief.parse supports them and you have extractors
+                 else:
+                      logger.debug("Generic LIEF parse did not identify PE/ELF/MachO.")
+                      # Final fallback to suffix if still unknown
+                      fallback_type = file_suffix_fallback(path) # Assuming this helper exists
+                      if fallback_type in ['pdf', 'script']:
+                           file_type = fallback_type
+
+             except lief.bad_file as lbf:
+                  logger.warning(f"LIEF generic parse failed for {path}: {lbf}")
+             except Exception as lief_err:
+                  logger.error(f"Unexpected LIEF generic parse error for {path}: {lief_err}", exc_info=False)
+
+    except Exception as parse_err:
+         logger.error(f"Error during LIEF parsing stage for {path}: {parse_err}")
+    finally:
+        if mem_file: mem_file.close()
+
+    # Return magic info along with type and binary object
+    magic_info = {'desc': magic_desc, 'mime': mime_type}
+    return file_type, binary, magic_info
+
+
+@timer
+def extract_typed_features(file_type, path, raw_bytes, binary):
+    """Calls the appropriate feature extractor based on file type."""
+    typed_features = {}
+
+    if file_type == 'pe' and binary:
+        # Extract PE specific features
+        pe_feats = extract_features_pe(path, raw_bytes, binary) # Assumes this is timed internally or fast enough
+        typed_features.update(pe_feats)
+
+        # Extract PE Opcode/Entrypoint features
+        try:
+            entrypoint_bytes, byte_mean = extract_entrypoint_bytes_mean(binary, 1024) # Timed internally
+            I386_VAL, AMD64_VAL, ARM_VAL, ARMNT_VAL, ARM64_VAL = 0x14c, 0x8664, 0x1c0, 0x1c4, 0xaa64
+            pe_arch, pe_mode = capstone.CS_ARCH_X86, capstone.CS_MODE_32
+            if hasattr(binary, 'header') and hasattr(binary.header, 'machine') and hasattr(binary.header.machine, 'value'):
+                machine_val = binary.header.machine.value
+                if machine_val == AMD64_VAL: pe_mode = capstone.CS_MODE_64
+                elif machine_val == ARM_VAL: pe_arch, pe_mode = capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM
+                elif machine_val == ARMNT_VAL: pe_arch, pe_mode = capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB
+                elif machine_val == ARM64_VAL: pe_arch, pe_mode = capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM
+            # Call opcode extractor (timed internally)
+            opcode_entropy, opcode_histogram = extract_opcode_features_py(entrypoint_bytes, TOP_N_OPCODES, arch=pe_arch, mode=pe_mode)
+            typed_features['exec_entrypoint_mean'] = byte_mean
+            typed_features['exec_entrypoint_opcode_entropy'] = opcode_entropy
+            for i, val in enumerate(opcode_histogram): typed_features[f'exec_entrypoint_opcode_hist_{i}'] = float(val)
+        except Exception as opcode_err: logger.error(f"Error during PE entrypoint/opcode extraction: {opcode_err}", exc_info=True)
+
+    elif file_type == 'elf' and binary:
+        elf_feats = extract_features_elf(path, raw_bytes, binary) # Assumed timed or fast
+        typed_features.update(elf_feats)
+        # Add ELF opcode/entrypoint extraction here if needed
+    elif file_type == 'macho' and binary:
+        macho_feats = extract_macho_features(path, raw_bytes, binary) # Assumed timed or fast
+        typed_features.update(macho_feats)
+        # Add MachO opcode/entrypoint extraction here if needed
+    elif file_type == 'pdf':
+        pdf_feats = extract_features_pdf(path, raw_bytes) # Assumed timed or fast
+        typed_features.update(pdf_feats)
+    elif file_type == 'script':
+        script_feats = extract_features_script(path, raw_bytes) # Assumed timed or fast
+        typed_features.update(script_feats)
+    else: # Unknown or no specific extractor needed
+         logger.info(f"No specific typed extractor for file_type '{file_type}' for {path}.")
+
+    return typed_features
+
+@timer # Timer for the main orchestrator function
 def extract_features(path):
     """
     Main feature extraction orchestrator. Detects file type, calls appropriate
     extractors, and assembles the final unified feature vector.
-    Includes temporary LIEF debugging prints.
+    Refactored into sub-functions with @timer decorators.
     """
-    all_features = {} # Dictionary to hold all collected features
-    # Ensure initialization uses the final target size for consistency on errors
+    all_features = {}
     output_vector = [0.0] * TARGET_VECTOR_SIZE
-    binary = None # Initialize binary object variable
-    is_pe = is_elf = is_macho = is_pdf = is_script = False # Initialize flags
+    binary = None # Keep binary object reference if needed later
 
     try:
-        # --- 0. Read File ---
-        try:
-            with open(path, "rb") as f:
-                raw_bytes = f.read()
-            file_size = len(raw_bytes)
-        except FileNotFoundError:
-            logger.error(f"File not found: {path}")
-            return [0.0] * TARGET_VECTOR_SIZE # Return default zero vector
-        except OSError as e:
-            logger.error(f"OS error reading file {path}: {e}")
-            return [0.0] * TARGET_VECTOR_SIZE # Return default zero vector
+        # --- 1. Read File ---
+        raw_bytes, file_size = read_file_content(path)
+        if raw_bytes is None or file_size == 0:
+            return output_vector # Return default zero vector
 
-        if file_size == 0:
-            logger.warning(f"File {path} is empty.")
-            return [0.0] * TARGET_VECTOR_SIZE # Return default zero vector
+        # --- 2. Calculate General Content Features ---
+        general_features = calculate_general_features(raw_bytes, file_size)
+        all_features.update(general_features)
 
-        all_features['general_file_size'] = float(file_size)
+        # --- 3. Run Scanners (Strings & YARA) ---
+        # String features (already timed with @timer)
+        string_features = extract_string_features_py(raw_bytes, MAX_STRING_SCAN, SUSPICIOUS_TERMS_SET)
+        all_features.update(string_features)
 
-        # --- 1. Run Generic Extractors ---
-        gen_entropy = entropy(raw_bytes) # Assumes entropy() is defined
-        all_features['general_entropy'] = gen_entropy
-
-        # Entropy buckets
-        if file_size > 0:
-            # Assumes np is imported as numpy
-            freq = np.bincount(np.frombuffer(raw_bytes, dtype=np.uint8), minlength=256)
-            total = file_size
-            # Assumes MAX_ENTROPY_BUCKETS is defined
-            for i in range(MAX_ENTROPY_BUCKETS):
-                start = i * (256 // MAX_ENTROPY_BUCKETS)
-                end = (i + 1) * (256 // MAX_ENTROPY_BUCKETS)
-                bucket_sum = np.sum(freq[start:end])
-                all_features[f'general_entropy_bucket_{i}'] = float(bucket_sum / total)
-        else:
-            for i in range(MAX_ENTROPY_BUCKETS):
-                all_features[f'general_entropy_bucket_{i}'] = 0.0
-
-        # String features
-        # Assumes extract_string_features_py, MAX_STRING_SCAN, SUSPICIOUS_TERMS_SET defined
-        string_features_dict = extract_string_features_py(raw_bytes[:MAX_STRING_SCAN], MAX_STRING_SCAN, SUSPICIOUS_TERMS_SET)
-        all_features.update(string_features_dict)
-
-        # YARA features
-        # Assumes run_yara_rules, COMPILED_YARA_RULES defined
+        # YARA features (already timed with @timer)
         yara_results = run_yara_rules(raw_bytes, COMPILED_YARA_RULES, filepath_for_logging=path)
         all_features['yara_total_hits'] = float(sum(yara_results.values()))
-        # Assumes SORTED_YARA_RULE_NAMES, FEATURE_NAME_TO_INDEX defined
         for rule_name in SORTED_YARA_RULE_NAMES:
-            if rule_name:
-                feature_key = f'yara_hit_{rule_name}'
-                if feature_key in FEATURE_NAME_TO_INDEX:
-                    all_features[feature_key] = float(yara_results.get(rule_name, 0.0))
+             if rule_name:
+                 feature_key = f'yara_hit_{rule_name}'
+                 if feature_key in FEATURE_NAME_TO_INDEX:
+                     all_features[feature_key] = float(yara_results.get(rule_name, 0.0))
+
+        # --- 4. Identify Type & Parse ---
+        file_type, binary, magic_info = identify_file_type_and_parse(path, raw_bytes)
+
+        # Add magic hashes from identification step
+        all_features['general_magic_hash'] = float(safe_str_hash(magic_info.get('desc', '')))
+        all_features['general_magic_desc_hash'] = float(safe_str_hash(magic_info.get('desc', ''))) # Duplicate for now? Or hash mime?
+        # Add type flags
+        all_features['general_is_pe'] = float(file_type == 'pe')
+        all_features['general_is_elf'] = float(file_type == 'elf')
+        all_features['general_is_macho'] = float(file_type == 'macho')
+        all_features['general_is_pdf'] = float(file_type == 'pdf')
+        all_features['general_is_script'] = float(file_type == 'script')
 
 
-        # --- 2. File Type Detection (Magic) ---
-        magic_desc = ""
-        magic_hash = 0.0
-        # Assumes 'magic' object/library is imported and configured
-        try:
-            magic_desc = magic.from_buffer(raw_bytes).lower()
-            # Assumes safe_str_hash defined
-            magic_hash = float(safe_str_hash(magic_desc))
-            logger.debug(f"Magic description for {path}: {magic_desc}")
-        except Exception as magic_err:
-            logger.warning(f"python-magic failed for {path}: {magic_err}")
-        all_features['general_magic_hash'] = magic_hash
-        # Assumes 'general_magic_desc_hash' is the intended feature name
-        all_features['general_magic_desc_hash'] = float(safe_str_hash(magic_desc))
+        # --- 5. Extract Typed Features ---
+        typed_features = extract_typed_features(file_type, path, raw_bytes, binary)
+        all_features.update(typed_features)
 
 
-        # --- 3. LIEF Parsing using io.BytesIO ---
-        mem_file = None
-        parsed_obj = None
-        try:
-            logger.debug(f"Attempting LIEF parsing from io.BytesIO for {path}")
-            mem_file = io.BytesIO(raw_bytes)
-            mem_file.seek(0)
-            parsed_obj = lief.parse(mem_file) # Pass file-like object
-
-            if parsed_obj is None:
-                logger.warning(f"lief.parse(io.BytesIO) returned None for file: {path}.")
-            elif isinstance(parsed_obj, lief.PE.Binary):
-                logger.debug(f"lief.parse(io.BytesIO) successful. Identified as PE.")
-                is_pe = True
-                binary = parsed_obj # Assign the parsed object
-            elif isinstance(parsed_obj, lief.ELF.Binary):
-                logger.debug(f"lief.parse(io.BytesIO) successful. Identified as ELF.")
-                is_elf = True
-                binary = parsed_obj
-            elif isinstance(parsed_obj, lief.MachO.Binary):
-                logger.debug(f"lief.parse(io.BytesIO) successful. Identified as MachO.")
-                is_macho = True
-                binary = parsed_obj
-            else:
-                logger.info(f"LIEF parsed file {path} as type {type(parsed_obj)}, but no specific executable extractor for it.")
-                # Fallback check based on magic_desc/extension
-                if 'pdf' in magic_desc or path.lower().endswith('.pdf'): is_pdf = True
-                elif 'text' in magic_desc or path.lower().endswith(('.py', '.js', '.vbs', '.sh', '.bat', '.ps1')): is_script = True
-
-        # Catch Exceptions during LIEF parsing or type checking
-        except Exception as e_parse:
-            logger.warning(f"LIEF parse(io.BytesIO) or subsequent type check failed for file {path}: {type(e_parse).__name__}: {e_parse}. Checking non-exec types.")
-            binary = None # Ensure binary is None on any parsing failure
-            # Fallback check based on magic_desc/extension
-            if 'pdf' in magic_desc or path.lower().endswith('.pdf'): is_pdf = True
-            elif 'text' in magic_desc or path.lower().endswith(('.py', '.js', '.vbs', '.sh', '.bat', '.ps1')): is_script = True
-
-        finally:
-            # Explicitly close the BytesIO object
-            if mem_file:
-                mem_file.close()
-
-        # Update type flags based on parsing results or fallbacks
-        all_features['general_is_pe'] = float(is_pe)
-        all_features['general_is_elf'] = float(is_elf)
-        all_features['general_is_macho'] = float(is_macho)
-        all_features['general_is_pdf'] = float(is_pdf)
-        all_features['general_is_script'] = float(is_script)
-
-
-        # --- 4. Run Specific Extractors Based on Type ---
-        if is_pe and binary:
-            logger.debug(f"Calling extract_features_pe for {path}")
-            # Assumes extract_features_pe is defined
-            pe_feats = extract_features_pe(path, raw_bytes, binary)
-            all_features.update(pe_feats)
-
-            # Extract Entrypoint/Opcodes (using default arch/mode for this debug run)
-            logger.debug("Attempting PE entrypoint/opcode extraction (using default arch/mode for debug)...")
-            try:
-                entrypoint_bytes, byte_mean = extract_entrypoint_bytes_mean(binary, 1024)
-                pe_arch = capstone.CS_ARCH_X86
-                pe_mode = capstone.CS_MODE_32
-
-                if hasattr(binary, 'header') and hasattr(binary.header, 'machine'):
-                    machine_obj = binary.header.machine
-
-                    # --- Compare machine type using integer value ---
-                    if hasattr(machine_obj, 'value'):
-                        machine_val = machine_obj.value
-                        logger.debug(f"Machine type raw value: {machine_val}")
-                        # Standard PE Machine Type Values
-                        I386_VAL = 0x14c  # 332
-                        AMD64_VAL = 0x8664 # 34404
-                        ARM_VAL = 0x1c0   # 448
-                        ARM64_VAL = 0xaa64 # 43620
-
-                        if machine_val == AMD64_VAL:
-                            logger.debug("Setting Capstone mode to 64-bit")
-                            pe_mode = capstone.CS_MODE_64
-                        elif machine_val == ARM_VAL:
-                            logger.debug("Setting Capstone arch/mode to ARM")
-                            pe_arch = capstone.CS_ARCH_ARM
-                            pe_mode = capstone.CS_MODE_ARM
-                        elif machine_val == ARM64_VAL:
-                            logger.debug("Setting Capstone arch/mode to ARM64")
-                            pe_arch = capstone.CS_ARCH_ARM64
-                            pe_mode = capstone.CS_MODE_ARM
-                        elif machine_val == I386_VAL:
-                            logger.debug("Machine is I386, using default Capstone X86/32-bit")
-                            pass # Defaults are already X86/32-bit
-                        else:
-                            logger.warning(f"Unhandled PE machine type value: {machine_val}. Using default X86/32-bit.")
-                    else:
-                        logger.warning("Machine type object does not have '.value'. Cannot determine arch/mode accurately. Using default.")
-                    # --- End machine type value comparison ---
-
-                # Call opcode extractor
-                opcode_entropy, opcode_histogram = extract_opcode_features_py(
-                    entrypoint_bytes, TOP_N_OPCODES, arch=pe_arch, mode=pe_mode
-                )
-                # Assign features
-                all_features['exec_entrypoint_mean'] = byte_mean
-                all_features['exec_entrypoint_opcode_entropy'] = opcode_entropy
-                for i, val in enumerate(opcode_histogram):
-                    all_features[f'exec_entrypoint_opcode_hist_{i}'] = float(val)
-
-            except Exception as opcode_err:
-                logger.error(f"Error during PE entrypoint/opcode extraction for {path}: {opcode_err}", exc_info=True)
-
-        elif is_elf and binary:
-            logger.debug(f"Calling extract_features_elf for {path}")
-            # Assumes extract_features_elf is defined
-            elf_feats = extract_features_elf(path, raw_bytes, binary)
-            all_features.update(elf_feats)
-            # TODO: Add ELF specific generics if needed
-
-        elif is_macho and binary:
-            logger.debug(f"Calling extract_features_macho for {path}")
-            # Assumes extract_features_macho is defined
-            macho_feats = extract_macho_features(path, raw_bytes, binary)
-            all_features.update(macho_feats)
-            # TODO: Add Mach-O specific generics if needed
-
-        elif is_pdf:
-            # Assumes PDF_LIB_AVAILABLE is defined globally
-            if PDF_LIB_AVAILABLE:
-                logger.debug(f"Calling extract_features_pdf for {path}")
-                # Assumes extract_features_pdf is defined
-                pdf_feats = extract_features_pdf(path, raw_bytes)
-                all_features.update(pdf_feats)
-        elif is_script:
-            logger.debug(f"Calling extract_features_script for {path}")
-            # Assumes extract_features_script is defined
-            script_feats = extract_features_script(path, raw_bytes)
-            all_features.update(script_feats)
-        elif not (is_pe or is_elf or is_macho or is_pdf or is_script): # Log if no type was identified
-            logger.info(f"File {path} not identified as any specific type. Using general features only.")
-
-        # --- 5. Assemble Vector based on FINAL_FEATURE_ORDER ---
-        # Create the vector based on the defined order, getting values from all_features dict
+        # --- 6. Assemble Final Vector ---
         output_vector_ordered = [0.0] * len(FINAL_FEATURE_ORDER)
         for i, feature_name in enumerate(FINAL_FEATURE_ORDER):
-            output_vector_ordered[i] = float(all_features.get(feature_name, 0.0))
+             output_vector_ordered[i] = float(all_features.get(feature_name, 0.0))
 
-        # --- 6. Pad or Truncate to TARGET_VECTOR_SIZE ---
+        # --- 7. Pad or Truncate ---
         current_len = len(output_vector_ordered)
         if current_len < TARGET_VECTOR_SIZE:
             padding_needed = TARGET_VECTOR_SIZE - current_len
             output_vector = output_vector_ordered + ([0.0] * padding_needed)
-            logger.debug(f"Padded feature vector with {padding_needed} zeros.")
         elif current_len > TARGET_VECTOR_SIZE:
             logger.warning(f"Defined features ({current_len}) exceed target size ({TARGET_VECTOR_SIZE}). Truncating vector!")
             output_vector = output_vector_ordered[:TARGET_VECTOR_SIZE]
         else:
-            output_vector = output_vector_ordered # Sizes match
+            output_vector = output_vector_ordered
 
-        logger.debug(f"Feature extraction complete for {path}. Final vector size: {len(output_vector)}")
-
-        logger.debug("\n" + "="*25 + f" Features for {os.path.basename(path)} " + "="*25)
-        max_name_len = 0
-        if FINAL_FEATURE_ORDER:
-            # Calculate padding width based on longest feature name
-            max_name_len = max(len(name) for name in FINAL_FEATURE_ORDER)
-
-        # Iterate through the DEFINED feature order and print name/value from the calculated vector
-        for i, name in enumerate(FINAL_FEATURE_ORDER):
-            # Get value from the ordered vector (before padding/truncation)
-            # Ensure index is within bounds of the ordered vector
-            value = output_vector_ordered[i] if i < len(output_vector_ordered) else 0.0
-            # Format: [Index] Name (padded) : Value
-            # Adjust index padding based on total number of defined features
-            idx_padding = len(str(len(FINAL_FEATURE_ORDER)))
-            logger.debug(f"[{i:{idx_padding}}] {name:<{max_name_len}} : {value:>.8f}") # 8 decimal places
-
-        # Print summary of padding/truncation/final size
-        if current_len < TARGET_VECTOR_SIZE:
-            logger.debug(f"\n... Vector padded with {TARGET_VECTOR_SIZE - current_len} zeros to reach target size {TARGET_VECTOR_SIZE}.")
-        elif current_len > TARGET_VECTOR_SIZE:
-            logger.debug(f"\n... Vector truncated from {current_len} features to target size {TARGET_VECTOR_SIZE}.")
-        logger.debug(f"Total named features listed: {len(FINAL_FEATURE_ORDER)}")
-        logger.debug(f"Final vector size returned: {len(output_vector)}")
-        logger.debug("="*(52 + len(os.path.basename(path))) + "\n")
-
-    # --- Outer Exception Handler ---
     except Exception as e:
         logger.error(f"Unhandled error during feature extraction orchestrator for {path}: {e}", exc_info=True)
-        # Return default zero vector on major failure, ensure size matches target
-        output_vector = [0.0] * TARGET_VECTOR_SIZE
+        logger.info(f"TIMING [extract_features]: === FAILED for {os.path.basename(path)} after {time.time() - t_main_start:.4f}s ===")
+        output_vector = [0.0] * TARGET_VECTOR_SIZE # Ensure correct size on failure
 
     finally:
-        # Explicitly delete LIEF object if it exists
+        # Explicitly delete LIEF object if it exists (binary is local to this scope now)
         if binary is not None:
             logger.debug(f"Deleting LIEF binary object for {path}")
-            try:
-                del binary
-            except NameError: # Should not happen, but defensive
-                pass
+            # No need to 'del binary' explicitly, it goes out of scope. Garbage collection handles it.
+            pass
 
-    # Ensure the returned vector has the correct target size, even after errors
+    # Final size check
     if len(output_vector) != TARGET_VECTOR_SIZE:
-        logger.error(f"Final vector size mismatch! Expected {TARGET_VECTOR_SIZE}, got {len(output_vector)}. Returning zero vector.")
-        return [0.0] * TARGET_VECTOR_SIZE
+         logger.error(f"Final vector size mismatch! Expected {TARGET_VECTOR_SIZE}, got {len(output_vector)}. Returning zero vector.")
+         return [0.0] * TARGET_VECTOR_SIZE
 
     return output_vector
+
 
 # --- Main Execution Logic ---
 def process_file(path):
